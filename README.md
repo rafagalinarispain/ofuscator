@@ -295,7 +295,7 @@ Each character class is replaced individually, preserving structural separators 
 
 ## Benchmark results
 
-Tested against a live MongoDB 5.0.31 instance (`m 5.0.31`, `slowMs = 0`) with a workload generating real PII across 17 sensitive data categories (emails, SSNs, credit cards, passports, IPs, HIV status, password hashes, API keys, bearer tokens, IBAN, crypto wallets, `$comment` tags, db/collection names, and more).
+Tested against a live MongoDB 5.0.31 instance (`m 5.0.31`, `slowMs = 0`) with a workload generating real PII across 17 sensitive data categories (emails, SSNs, credit cards, passports, IPs, HIV status, password hashes, API keys, bearer tokens, IBAN, crypto wallets, array field tags, db/collection names, and more).
 
 | Tool | Residual PII matches | Lines out / in | % PII removed |
 |------|:-------------------:|:--------------:|:-------------:|
