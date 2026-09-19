@@ -1,6 +1,6 @@
 # ofuscator.py — Enhanced MongoDB Log Obfuscation Tool
 
-An enhanced version of [fruitsalad](https://github.com/rueckstiess/fruitsalad) by Thomas Rueckstiess, with deep PII field-walking, namespace redaction, character-replacement mode, and deterministic seeding.
+A modified version of [fruitsalad](https://github.com/rueckstiess/fruitsalad) by Thomas Rueckstiess, with deep PII field-walking, namespace redaction, character-replacement mode, and deterministic seeding.
 
 ---
 
