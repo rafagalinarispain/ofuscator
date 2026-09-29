@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
 """
-ofuscator.py - Enhanced MongoDB log obfuscation tool.
+ofuscator.py - Enhanced MongoDB log and FTDC obfuscation tool.
 
 Based on fruitsalad (https://github.com/rueckstiess/fruitsalad) by Thomas Rueckstiess.
 
-Enhancements:
-  --pii            Deep PII obfuscation: walks into attr.command values (emails,
-                   URLs, strings, nested objects/arrays) instead of hashing the
-                   whole command blob.
-  --addFields      Comma-separated list of additional top-level command fields to
-                   obfuscate (e.g. '$comment', '_tid').
-  --redactNamespaces
-                   Replace every database name and collection name with a stable
-                   opaque token (REDACTED_<8-char-hash>) so that the real
-                   namespace is never visible in the output.  Well-known system
-                   namespaces (local, admin, config, $cmd) are preserved.
-                   Covers: attr.ns, attr.command.$db, attr.command.find/update/
-                   insert/delete/aggregate/collection, and all other paths that
-                   go through namespace obfuscation.  In text-mode logs every
-                   dotted hostname/namespace segment is also replaced.
-  --char_replacement
-                   Used alone: replaces ALL obfuscated values with an x-pattern
-                   placeholder (e.g. "lemon@antiquewhite.com" → "xxxxx@xxxxxxxxxxx.xxx").
-                   No fruit/colour names are used at all.
-                   Used together with --seed and --char_fields: the main obfuscation
-                   uses fruit/colour names (seeded), but the fields listed in
-                   --char_fields are replaced with x-pattern instead, making those
-                   specific fields immediately identifiable as processed.
-  --char_fields    Comma-separated field names that should receive x-pattern output
-                   when --char_replacement and --seed are both active.
-                   Has no effect without --char_replacement.
-  --seed           Seed the random number generator (same seed → same mapping).
+Two main operating modes, selected by a required top-level flag:
+
+  --log_redact <logfile>
+        Obfuscate a MongoDB log file (JSON structured or legacy text format).
+        All options below apply only to this mode.
+
+        --seed S / -s S          Seed the random number generator with S.
+        --pii                    Deep PII obfuscation (field-by-field walk).
+        --addFields FIELDS       Extra command-level fields to obfuscate.
+        --redactNamespaces       Replace db/collection names with REDACTED_<hash>.
+        --char_replacement       Use x-pattern instead of fruit/colour names.
+        --char_fields FIELDS     Fields that get x-pattern in selective mode.
+
+  --ftdc_redact
+        Redact hostInfo from FTDC diagnostic.data metrics.* files.
+
+        --input_dir DIR   (required) Directory containing metrics.* files.
+        --output_dir DIR  (required) Directory to write redacted files into.
+
+        For each metrics.* file found in --input_dir the tool will:
+          1. Read the raw BSON documents.
+          2. In every type-0 (metadata) chunk, redact hostInfo:
+               - All scalar string/numeric/bool field values are replaced with "#".
+               - hostInfo.system.hostname is replaced with
+                 "redacted_hostname_redacted_port_number" always.
+                 the hostname string (host:port) or from getCmdLineOpts.
+               - datetime fields (start/end/currentTime) are preserved.
+               - The "ok" field is preserved.
+          3. Re-encode the documents back to BSON.
+          4. Write the result to --output_dir/<same filename>.
+
+        Requires: pymongo  (pip install pymongo)
 """
 
 from enum import Enum
@@ -43,6 +48,9 @@ import sys
 import traceback
 import json
 import operator
+import os
+import struct
+import glob as _glob
 
 # ── Word lists from fruitsalad ────────────────────────────────────────────────
 adjectives = [
@@ -765,73 +773,382 @@ class Obfuscator:
         return LogType.JSON if line.startswith('{') else LogType.TEXT
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# FTDC redaction
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FtdcRedactor:
+    """
+    Redact hostInfo fields from MongoDB FTDC metrics.* files.
+
+    For every metrics.* file found in input_dir:
+      - Read the raw BSON stream (sequence of length-prefixed BSON docs).
+      - In each type-0 (metadata) chunk, replace the values inside the
+        'hostInfo' sub-document with '#', except:
+          * datetime fields (start / end / currentTime / any datetime.datetime)
+            are preserved as-is.
+          * The 'ok' field is preserved.
+          * hostInfo.system.hostname is replaced with a stable label:
+                 "redacted_hostname_redacted_port_number" always.
+      - type-1 (metric delta) chunks are written unchanged — they contain
+        only compressed numeric deltas and carry no hostInfo text.
+      - Write the resulting BSON stream to output_dir/<original filename>.
+
+    Requires pymongo (provides the bson package).
+    """
+
+    # Datetime type from Python's datetime module — used for isinstance checks
+    # after bson decodes BSON Date values.
+    _DATETIME_TYPE = None
+
+    def __init__(self, input_dir, output_dir):
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self._ensure_bson()
+
+    @staticmethod
+    def _ensure_bson():
+        """Raise a clear error if pymongo/bson is not installed."""
+        try:
+            import bson  # noqa: F401
+        except ImportError:
+            sys.exit(
+                'ERROR: --ftdc_redact requires the pymongo package.\n'
+                '       Install it with:  pip install pymongo\n'
+            )
+
+    # ── BSON I/O ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _read_bson_docs(path):
+        """
+        Read a raw BSON file and return a list of (raw_bytes, decoded_dict) tuples.
+
+        BSON format: each document is a 4-byte little-endian int32 length
+        followed by (length - 4) bytes of data.  The length includes the 4
+        length bytes themselves.
+        """
+        import bson
+
+        docs = []
+        with open(path, 'rb') as fh:
+            data = fh.read()
+
+        offset = 0
+        while offset < len(data):
+            if offset + 4 > len(data):
+                break
+            doc_size = struct.unpack_from('<i', data, offset)[0]
+            if doc_size < 5 or offset + doc_size > len(data):
+                # Malformed or trailing padding — stop
+                break
+            raw = data[offset:offset + doc_size]
+            decoded = bson.decode(raw)
+            docs.append((raw, decoded))
+            offset += doc_size
+
+        return docs
+
+    @staticmethod
+    def _encode_doc(doc):
+        """Re-encode a decoded BSON dict back to bytes."""
+        import bson
+        return bson.encode(doc)
+
+    # ── Member-id derivation ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _derive_member_id(docs):
+        """
+        Return the replication member _id (integer) for this node by scanning
+        the first type-1 (metric delta) chunk in the file.
+
+        FTDC type-1 payload layout:
+          bytes 0-3  : uint32 uncompressed length (little-endian)
+          bytes 4-N  : zlib-compressed stream
+          decompressed: BSON reference doc  followed by packed int64 deltas
+
+        The reference doc contains a full serverStatus + replSetGetStatus
+        snapshot.  replSetGetStatus.members is a list; the entry with
+        self=True is this node.  Its _id field is the RS member id.
+
+        Falls back to 'unknown' if the chunk cannot be decoded.
+        """
+        import zlib
+        import bson as _bson
+
+        for _raw, decoded in docs:
+            if decoded.get('type') != 1:
+                continue
+            try:
+                payload = bytes(decoded.get('data', b''))
+                # First 4 bytes are the uncompressed length; zlib stream follows.
+                decompressed = zlib.decompress(payload[4:])
+                ref_sz = struct.unpack_from('<i', decompressed, 0)[0]
+                if ref_sz < 5 or ref_sz > len(decompressed):
+                    continue
+                ref_doc = _bson.decode(decompressed[:ref_sz])
+                members = ref_doc.get('replSetGetStatus', {}).get('members', [])
+                for m in members:
+                    if m.get('self'):
+                        return str(int(m['_id']))
+            except Exception:
+                pass
+
+        return 'unknown'
+
+    # ── hostInfo redaction ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_datetime(value):
+        """Return True for Python datetime objects (produced by bson.decode)."""
+        import datetime
+        return isinstance(value, datetime.datetime)
+
+    def _redact_hostinfo_value(self, value):
+        """
+        Recursively replace scalar values with '#'.
+
+        Preservation rules:
+          - datetime.datetime values → kept as-is (timestamps are not PII here)
+          - dict/list → recurse
+          - everything else (str, int, float, bool, None) → '#'
+        """
+        if self._is_datetime(value):
+            return value
+        if isinstance(value, dict):
+            return {k: self._redact_hostinfo_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._redact_hostinfo_value(v) for v in value]
+        return '#'
+
+    def _redact_hostinfo(self, doc, member_id):
+        """
+        Mutate the decoded type-0 BSON doc in place:
+          - Walk hostInfo recursively and replace all scalar values with '#'.
+          - Restore preserved fields:
+              * Any datetime value in the walk is kept (handled by _redact_hostinfo_value).
+              * 'ok' field at any level is set back to its original value.
+          - Replace hostInfo.system.hostname with
+            "redacted_hostname_<member_id>:redacted_port_number".
+        """
+        hi = doc.get('doc', {}).get('hostInfo')
+        if not isinstance(hi, dict):
+            return  # nothing to do
+
+        # Save 'ok' value before redaction (float like 1.0)
+        ok_value = hi.get('ok')
+
+        # Deep-redact all values
+        redacted_hi = self._redact_hostinfo_value(hi)
+
+        # Restore 'ok'
+        if ok_value is not None:
+            redacted_hi['ok'] = ok_value
+
+        # Set the redacted hostname with the RS member _id embedded
+        if isinstance(redacted_hi.get('system'), dict):
+            redacted_hi['system']['hostname'] = (
+                f'redacted_hostname_{member_id}:redacted_port_number'
+            )
+
+        doc['doc']['hostInfo'] = redacted_hi
+
+    # ── Per-file processing ───────────────────────────────────────────────────
+
+    def _process_file(self, src_path, dst_path):
+        """Read src_path, redact, write to dst_path."""
+        docs = self._read_bson_docs(src_path)
+
+        # Derive the RS member _id from the first type-1 chunk's reference doc
+        member_id = self._derive_member_id(docs)
+
+        out_chunks = []
+        redacted_count = 0
+        for raw, decoded in docs:
+            if decoded.get('type') == 0:
+                # Metadata chunk — redact hostInfo
+                self._redact_hostinfo(decoded, member_id)
+                out_chunks.append(self._encode_doc(decoded))
+                redacted_count += 1
+            else:
+                # type-1 metric delta chunk — pass through unchanged
+                out_chunks.append(raw)
+
+        with open(dst_path, 'wb') as fh:
+            for chunk in out_chunks:
+                fh.write(chunk)
+
+        return len(docs), redacted_count
+
+    # ── Main entry point ──────────────────────────────────────────────────────
+
+    def run(self):
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # Find all metrics.* files in input_dir (non-recursive by design;
+        # diagnostic.data is a flat directory)
+        pattern = os.path.join(self.input_dir, 'metrics.*')
+        files = sorted(_glob.glob(pattern))
+
+        if not files:
+            sys.stderr.write(
+                f'WARNING: no metrics.* files found in {self.input_dir!r}\n')
+            return
+
+        total_files = len(files)
+        sys.stderr.write(
+            f'[ftdc_redact] Found {total_files} metrics.* file(s) in {self.input_dir!r}\n')
+
+        for i, src_path in enumerate(files, 1):
+            filename = os.path.basename(src_path)
+            dst_path = os.path.join(self.output_dir, filename)
+            try:
+                n_docs, n_redacted = self._process_file(src_path, dst_path)
+                sys.stderr.write(
+                    f'  [{i}/{total_files}] {filename}: '
+                    f'{n_docs} docs, {n_redacted} metadata chunk(s) redacted '
+                    f'→ {dst_path}\n'
+                )
+            except Exception as exc:
+                sys.stderr.write(
+                    f'  [{i}/{total_files}] {filename}: ERROR — {exc}\n')
+                traceback.print_exc(file=sys.stderr)
+
+        sys.stderr.write('[ftdc_redact] Done.\n')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description=(
-            'ofuscator.py — Enhanced MongoDB log obfuscation tool.\n'
-            'Based on fruitsalad (https://github.com/rueckstiess/fruitsalad).'
+            'ofuscator.py — MongoDB log and FTDC obfuscation tool.\n'
+            'Based on fruitsalad (https://github.com/rueckstiess/fruitsalad).\n\n'
+            'Select one of the two operating modes with a required flag:\n'
+            '  --log_redact <logfile>   Obfuscate a MongoDB log file.\n'
+            '  --ftdc_redact            Redact hostInfo from FTDC metrics files.\n'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        'logfile', type=str,
-        help='Path to the MongoDB log file to obfuscate.')
-    parser.add_argument(
+
+    # ── Mode selection ────────────────────────────────────────────────────────
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument(
+        '--log_redact', metavar='LOGFILE',
+        help=(
+            'Path to the MongoDB log file to obfuscate. '
+            'Supports JSON structured logs (MongoDB 4.4+) and legacy text logs.'
+        ),
+    )
+    mode_group.add_argument(
+        '--ftdc_redact', action='store_true', default=False,
+        help=(
+            'Redact hostInfo fields from FTDC diagnostic.data metrics.* files. '
+            'Requires --input_dir and --output_dir.'
+        ),
+    )
+
+    # ── Log-redact options ────────────────────────────────────────────────────
+    log_group = parser.add_argument_group(
+        'log_redact options',
+        'These options apply only when --log_redact is used.',
+    )
+    log_group.add_argument(
         '--seed', '-s', metavar='S', default=None,
         help='Seed the random number generator with S (any string). '
-             'Using the same seed on the same log produces the same output.')
-    parser.add_argument(
+             'Same seed on the same log always produces the same output.')
+    log_group.add_argument(
         '--pii', action='store_true', default=False,
         help='Enable deep PII obfuscation: walks into attr.command values '
              '(emails, URLs, user data, nested objects/arrays) instead of '
              'hashing the whole command blob.')
-    parser.add_argument(
+    log_group.add_argument(
         '--addFields', metavar='FIELDS', default=None,
-        help='Comma-separated list of extra command-level field names to '
-             'obfuscate when --pii is active (e.g. \'$comment,_tid\').')
-    parser.add_argument(
+        help="Comma-separated list of extra command-level field names to "
+             "obfuscate when --pii is active (e.g. '$comment,_tid').")
+    log_group.add_argument(
         '--redactNamespaces', action='store_true', default=False,
         help='Replace every database name and collection name with a stable '
-             'opaque token (REDACTED_<hash>) so that the real namespace is '
-             'never visible in the output. Well-known system namespaces '
-             '(local, admin, config, $cmd) are preserved. '
-             'Covers attr.ns, attr.command.$db, and all command collection '
-             'fields (find, update, insert, delete, aggregate, etc.).')
-    parser.add_argument(
+             'opaque token (REDACTED_<hash>). Well-known system namespaces '
+             '(local, admin, config, $cmd) are preserved.')
+    log_group.add_argument(
         '--char_replacement', action='store_true', default=False,
-        help='Obfuscate using x-pattern placeholders instead of fruit/colour names. '
-             'Used alone: ALL obfuscated values become x-pattern '
-             '(e.g. "lemon@antiquewhite.com" → "xxxxx@xxxxxxxxxxx.xxx"). '
-             'Used together with --seed and --char_fields: the main obfuscation '
-             'uses fruit/colour names, but the fields listed in --char_fields '
-             'receive x-pattern output, making them clearly identifiable as processed.')
-    parser.add_argument(
+        help='Use x-pattern placeholders instead of fruit/colour names. '
+             'Alone: all obfuscated values become x-pattern. '
+             'With --seed and --char_fields: only the listed fields get x-pattern.')
+    log_group.add_argument(
         '--char_fields', metavar='FIELDS', default=None,
-        help='Comma-separated field names that get x-pattern output when '
-             '--char_replacement and --seed are both active '
-             '(e.g. \'emails,externalShares,$comment\'). '
-             'All other fields continue to use fruit/colour obfuscation. '
-             'Has no effect without --char_replacement.')
+        help="Comma-separated field names that get x-pattern output when "
+             "--char_replacement and --seed are both active. "
+             "Has no effect without --char_replacement.")
+
+    # ── FTDC-redact options ───────────────────────────────────────────────────
+    ftdc_group = parser.add_argument_group(
+        'ftdc_redact options',
+        'These options apply only when --ftdc_redact is used.',
+    )
+    ftdc_group.add_argument(
+        '--input_dir', metavar='DIR', default=None,
+        help='Directory containing metrics.* FTDC files (required with --ftdc_redact).')
+    ftdc_group.add_argument(
+        '--output_dir', metavar='DIR', default=None,
+        help='Directory where redacted metrics.* files will be written '
+             '(required with --ftdc_redact). Created if it does not exist.')
 
     args = parser.parse_args()
 
-    add_fields = None
-    if args.addFields:
-        add_fields = [f.strip() for f in args.addFields.split(',') if f.strip()]
+    # ── Dispatch ──────────────────────────────────────────────────────────────
 
-    char_fields = None
-    if args.char_fields:
-        char_fields = [f.strip() for f in args.char_fields.split(',') if f.strip()]
+    if args.log_redact:
+        # Validate that FTDC-only options were not passed
+        if args.input_dir or args.output_dir:
+            parser.error('--input_dir / --output_dir are only valid with --ftdc_redact')
 
-    tool = Obfuscator(
-        arg_logfile=args.logfile,
-        arg_seed=args.seed,
-        arg_pii=args.pii,
-        arg_add_fields=add_fields,
-        arg_char_replacement=args.char_replacement,
-        arg_char_fields=char_fields,
-        arg_redact_namespaces=args.redactNamespaces,
-    )
-    tool.run()
+        add_fields = None
+        if args.addFields:
+            add_fields = [f.strip() for f in args.addFields.split(',') if f.strip()]
+
+        char_fields = None
+        if args.char_fields:
+            char_fields = [f.strip() for f in args.char_fields.split(',') if f.strip()]
+
+        tool = Obfuscator(
+            arg_logfile=args.log_redact,
+            arg_seed=args.seed,
+            arg_pii=args.pii,
+            arg_add_fields=add_fields,
+            arg_char_replacement=args.char_replacement,
+            arg_char_fields=char_fields,
+            arg_redact_namespaces=args.redactNamespaces,
+        )
+        tool.run()
+
+    elif args.ftdc_redact:
+        # Validate that log-only options were not passed
+        log_only_opts = {
+            '--seed': args.seed,
+            '--pii': args.pii,
+            '--addFields': args.addFields,
+            '--redactNamespaces': args.redactNamespaces,
+            '--char_replacement': args.char_replacement,
+            '--char_fields': args.char_fields,
+        }
+        for flag, val in log_only_opts.items():
+            if val:
+                parser.error(f'{flag} is only valid with --log_redact')
+
+        if not args.input_dir:
+            parser.error('--ftdc_redact requires --input_dir')
+        if not args.output_dir:
+            parser.error('--ftdc_redact requires --output_dir')
+        if not os.path.isdir(args.input_dir):
+            parser.error(f'--input_dir {args.input_dir!r} is not a directory or does not exist')
+
+        redactor = FtdcRedactor(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+        )
+        redactor.run()
