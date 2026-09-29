@@ -1,12 +1,48 @@
-# ofuscator.py — Enhanced MongoDB Log Obfuscation Tool
+# ofuscator.py — Enhanced MongoDB Log and FTDC Obfuscation Tool
 
-A modified version of [fruitsalad](https://github.com/rueckstiess/fruitsalad) by Thomas Rueckstiess, with deep PII field-walking, namespace redaction, character-replacement mode, and deterministic seeding.
+An enhanced version of [fruitsalad](https://github.com/rueckstiess/fruitsalad) by Thomas Rueckstiess, with deep PII field-walking, namespace redaction, character-replacement mode, deterministic seeding, and FTDC diagnostic data redaction.
 
 ---
 
 ## Overview
 
-`ofuscator.py` reads a MongoDB log file (JSON structured logs from MongoDB 4.4+, or legacy text logs) and outputs a fully redacted version safe to share with support teams.
+`ofuscator.py` operates in two distinct modes selected by a required top-level flag:
+
+| Mode | Flag | Purpose |
+|------|------|---------|
+| Log redaction | `--log_redact <logfile>` | Obfuscate a MongoDB log file (JSON structured or legacy text) |
+| FTDC redaction | `--ftdc_redact` | Redact `hostInfo` from FTDC `diagnostic.data/metrics.*` files |
+
+---
+
+## Requirements
+
+| Mode | Python | Extra packages |
+|------|--------|----------------|
+| `--log_redact` | 3.6+ | None (standard library only) |
+| `--ftdc_redact` | 3.6+ | `pymongo` (`pip install pymongo`) |
+
+---
+
+## Installation
+
+```bash
+curl -O https://raw.githubusercontent.com/10gen/employees/master/home/rafael.galinari/fruit_salad_enhanced/ofuscator.py
+chmod +x ofuscator.py
+
+# Only needed for --ftdc_redact:
+pip install pymongo
+```
+
+---
+
+## Mode 1 — Log redaction (`--log_redact`)
+
+Reads a MongoDB log file (JSON structured logs from MongoDB 4.4+, or legacy text logs) and outputs a fully redacted version safe to share with support teams.
+
+```
+python3 ofuscator.py --log_redact <logfile> [options]
+```
 
 **What is obfuscated:**
 
@@ -19,35 +55,10 @@ A modified version of [fruitsalad](https://github.com/rueckstiess/fruitsalad) by
 | Custom application fields (`$comment`, `_tid`, …) | Not touched | Obfuscated when listed in `--addFields` |
 | Free-text error messages (`errMsg`) | Not touched | Namespace tokens replaced with `--redactNamespaces` |
 
----
-
-## Requirements
-
-- Python 3.6+
-- No external dependencies (standard library only)
-
----
-
-## Installation
-
-```bash
-curl -O https://github.com/rafagalinarispain/ofuscator/ofuscator.py
-chmod +x ofuscator.py
-```
-
----
-
-## Usage
-
-```
-python3 ofuscator.py [options] <logfile>
-```
-
-### All options
+### Log redaction options
 
 | Flag | Description |
 |------|-------------|
-| `logfile` | Path to the MongoDB log file (required) |
 | `--seed S` / `-s S` | Seed the random number generator with `S`. Same seed → same mapping every run. Useful for consistent obfuscation across multiple log files from the same cluster. |
 | `--pii` | Enable **deep PII obfuscation**. Instead of hashing the entire command blob, walks into `attr.command` values and obfuscates 50+ known PII fields individually, preserving the document structure so log analysis tools can still parse it. |
 | `--addFields FIELDS` | Comma-separated list of **extra field names** to obfuscate on top of the built-in PII list. Applied recursively anywhere inside the command. Example: `'$comment,_tid,appId'` |
@@ -62,7 +73,7 @@ python3 ofuscator.py [options] <logfile>
 Replaces every database and collection name segment with a **stable, hash-based opaque token** — the same name always maps to the same token within a run.
 
 ```bash
-python3 ofuscator.py --pii --redactNamespaces mongod.log > redacted.log
+python3 ofuscator.py --log_redact mongod.log --pii --redactNamespaces > redacted.log
 ```
 
 **Input log fields:**
@@ -94,7 +105,7 @@ This flag has two distinct modes depending on how it is combined with other opti
 ### Used alone — replaces everything with x-pattern
 
 ```bash
-python3 ofuscator.py --pii --char_replacement mongod.log > redacted.log
+python3 ofuscator.py --log_redact mongod.log --pii --char_replacement > redacted.log
 ```
 
 All obfuscated values become x-pattern placeholders. No fruit/colour names are used. Makes it immediately obvious the log was processed — reviewers can search for real patterns (e.g. `@`) and confirm nothing slipped through.
@@ -111,9 +122,10 @@ All obfuscated values become x-pattern placeholders. No fruit/colour names are u
 ### Used with `--seed` and `--char_fields` — selective x-pattern
 
 ```bash
-python3 ofuscator.py --pii --seed myseed \
+python3 ofuscator.py --log_redact mongod.log \
+  --pii --seed myseed \
   --char_replacement --char_fields 'emails,externalShares,$comment' \
-  mongod.log > redacted.log
+  > redacted.log
 ```
 
 The **main obfuscation uses fruit/colour names** (seeded, consistent). Only the fields listed in `--char_fields` receive x-pattern output. Useful when most of the log should look naturally obfuscated but specific sensitive fields should be unmistakably blanked for review.
@@ -129,12 +141,12 @@ The **main obfuscation uses fruit/colour names** (seeded, consistent). Only the 
 
 ---
 
-## Examples
+## Log redaction examples
 
 ### Basic obfuscation (namespaces + IPs only)
 
 ```bash
-python3 ofuscator.py mongod.log > redacted.log
+python3 ofuscator.py --log_redact mongod.log > redacted.log
 ```
 
 Namespace segments replaced with fruit/colour words, IPs remapped to `192.168.x.x`. Query bodies are MD5-hashed as a single blob.
@@ -142,7 +154,7 @@ Namespace segments replaced with fruit/colour words, IPs remapped to `192.168.x.
 ### Deep PII obfuscation with a deterministic seed
 
 ```bash
-python3 ofuscator.py --pii --seed mysecretkey mongod.log > redacted.log
+python3 ofuscator.py --log_redact mongod.log --pii --seed mysecretkey > redacted.log
 ```
 
 Walks into command bodies field by field. Same seed on the same log always produces the same output — useful for correlating multiple log files from the same cluster.
@@ -150,13 +162,13 @@ Walks into command bodies field by field. Same seed on the same log always produ
 ### Full redaction recommended for external sharing
 
 ```bash
-python3 ofuscator.py \
+python3 ofuscator.py --log_redact mongod.log \
   --pii \
   --addFields '$comment,_tid,recordId,tenant' \
   --seed mysecretkey \
   --char_replacement \
   --redactNamespaces \
-  mongod.log > redacted.log
+  > redacted.log
 ```
 
 This combination achieves **100% PII removal** (verified against 17 sensitive data categories in an independent benchmark against MongoDB 5.0.31):
@@ -170,21 +182,85 @@ This combination achieves **100% PII removal** (verified against 17 sensitive da
 ### Obfuscate PII and specific extra fields only
 
 ```bash
-python3 ofuscator.py --pii --addFields '$comment,_tid' --seed test123 mongod.log > redacted.log
+python3 ofuscator.py --log_redact mongod.log --pii --addFields '$comment,_tid' --seed test123 > redacted.log
 ```
 
 ### Full x-pattern (no seed, blanket replacement)
 
 ```bash
-python3 ofuscator.py --pii --addFields '$comment,_tid' --char_replacement mongod.log > redacted.log
+python3 ofuscator.py --log_redact mongod.log --pii --addFields '$comment,_tid' --char_replacement > redacted.log
 ```
 
 ### Selective x-pattern — specific fields blanked, rest fruit/colour
 
 ```bash
-python3 ofuscator.py --pii --seed test123 \
+python3 ofuscator.py --log_redact mongod.log \
+  --pii --seed test123 \
   --char_replacement --char_fields 'emails,externalShares,$comment,_tid' \
-  mongod.log > redacted.log
+  > redacted.log
+```
+
+---
+
+## Mode 2 — FTDC redaction (`--ftdc_redact`)
+
+Redacts `hostInfo` fields from MongoDB FTDC `diagnostic.data/metrics.*` files so the files can be shared externally without exposing server hardware details, OS version, or hostname.
+
+```
+python3 ofuscator.py --ftdc_redact --input_dir <dir> --output_dir <dir>
+```
+
+### How it works
+
+FTDC files are a stream of raw BSON documents. Each file contains:
+- **type-0 (metadata) chunks** — full MongoDB server state snapshot including `buildInfo`, `getCmdLineOpts`, and `hostInfo`.
+- **type-1 (metric) chunks** — compressed numeric delta data; no text fields.
+
+The tool processes only type-0 chunks. For each one it:
+1. Replaces every scalar value inside `hostInfo` with `"#"`.
+2. Preserves datetime fields (`start`, `end`, `currentTime`) and the `ok` field.
+3. Replaces `hostInfo.system.hostname` with `redacted_hostname_<member_id>:redacted_port_number`, where `<member_id>` is the RS member `_id` read from `replSetGetStatus.members[self=true]._id` inside the first type-1 metric chunk (falls back to `unknown` if not found).
+4. Re-encodes the document as BSON and writes it to `--output_dir` under the same filename.
+
+Type-1 metric chunks are written byte-for-byte unchanged, so the redacted files remain valid FTDC files that can be analysed with standard tools (`ftdc-utils`, `mongodump` viewers, etc.).
+
+### FTDC redaction options
+
+| Flag | Description |
+|------|-------------|
+| `--input_dir DIR` | Directory containing `metrics.*` files (typically `diagnostic.data/`). Required. |
+| `--output_dir DIR` | Directory to write redacted files into. Created if it does not exist. Required. |
+
+### Example
+
+```bash
+python3 ofuscator.py --ftdc_redact \
+  --input_dir /data/db/diagnostic.data \
+  --output_dir /tmp/redacted_ftdc
+```
+
+**Before** (`hostInfo.system` in a type-0 chunk):
+```json
+"system": {
+  "currentTime": { "$date": "..." },
+  "hostname": "prod-rs1.internal.example.com:27017",
+  "cpuAddrSize": 64,
+  "memSizeMB": 65536,
+  "numCores": 32,
+  "cpuArch": "x86_64"
+}
+```
+
+**After**:
+```json
+"system": {
+  "currentTime": { "$date": "..." },
+  "hostname": "redacted_hostname_0:redacted_port_number",
+  "cpuAddrSize": "#",
+  "memSizeMB": "#",
+  "numCores": "#",
+  "cpuArch": "#"
+}
 ```
 
 ---
@@ -295,7 +371,7 @@ Each character class is replaced individually, preserving structural separators 
 
 ## Benchmark results
 
-Tested against a live MongoDB 5.0.31 instance (`m 5.0.31`, `slowMs = 0`) with a workload generating real PII across 17 sensitive data categories (emails, SSNs, credit cards, passports, IPs, HIV status, password hashes, API keys, bearer tokens, IBAN, crypto wallets, array field tags, db/collection names, and more).
+Tested against a live MongoDB 5.0.31 instance (`m 5.0.31`, `slowMs = 0`) with a workload generating real PII across 17 sensitive data categories (emails, SSNs, credit cards, passports, IPs, HIV status, password hashes, API keys, bearer tokens, IBAN, crypto wallets, `$comment` tags, db/collection names, and more).
 
 | Tool | Residual PII matches | Lines out / in | % PII removed |
 |------|:-------------------:|:--------------:|:-------------:|
