@@ -85,13 +85,13 @@ python3 mlogcensor.py pii_mongod50.log > out_mlogcensor.log
 ./hatchet -obfuscate pii_mongod50.log
 
 # ofuscator — full PII mode + namespace redaction + universal x-pattern
-python3 ofuscator.py \
+python3 ofuscator.py --log_redact pii_mongod50.log \
   --pii \
   --addFields '$comment,_tid,recordId,tenant' \
   --seed benchmark2026 \
   --char_replacement \
   --redactNamespaces \
-  pii_mongod50.log > out_ofuscator.log
+  > out_ofuscator.log
 ```
 
 ---
@@ -240,13 +240,13 @@ python3 ofuscator.py \
 
 **Invocation for full coverage:**
 ```bash
-python3 ofuscator.py \
+python3 ofuscator.py --log_redact pii_mongod50.log \
   --pii \
   --addFields '$comment,_tid,recordId,tenant' \
   --seed benchmark2026 \
   --char_replacement \
   --redactNamespaces \
-  pii_mongod50.log > redacted.log
+  > redacted.log
 ```
 
 **Pros:** **Only tool achieving 100% PII removal while producing valid JSON on all 43 lines.** `--redactNamespaces` replaces every db/collection segment with a stable `REDACTED_<8hex>` hash token, including free-text error messages. Deep field-aware PII walk covers 50+ named fields across identity, financial, health (HIPAA), auth, and HR domains. `--addFields` extends coverage without code changes. Deterministic with `--seed` for multi-shard log correlation. Visual `--char_replacement` mode helps reviewers confirm obfuscation before sharing.
