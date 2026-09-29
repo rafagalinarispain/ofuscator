@@ -31,7 +31,7 @@ A modified version of [fruitsalad](https://github.com/rueckstiess/fruitsalad) by
 ## Installation
 
 ```bash
-curl -O https://raw.githubusercontent.com/10gen/employees/master/home/rafael.galinari/fruit_salad_enhanced/ofuscator.py
+curl -O https://github.com/rafagalinarispain/ofuscator/ofuscator.py
 chmod +x ofuscator.py
 ```
 
