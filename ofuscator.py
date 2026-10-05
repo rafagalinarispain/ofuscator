@@ -602,7 +602,7 @@ class Obfuscator:
         def _walk(obj):
             if isinstance(obj, dict):
                 for k in list(obj.keys()):
-                    if k in self.add_fields:
+                    if k in self.add_fields or k.split('.')[-1] in self.add_fields:
                         obj[k] = self._obfuscate_value(obj[k], key=k)
                     else:
                         _walk(obj[k])
@@ -692,10 +692,11 @@ class Obfuscator:
                     )
                     self._set_by_path(loaded_line, err_path, redacted)
 
-        # --addFields: obfuscate specified fields anywhere in attr.command
-        cmd = self._get_by_path(loaded_line, "attr.command")
-        if cmd and self.add_fields:
-            self._obfuscate_add_fields(cmd)
+        # --addFields: obfuscate specified fields anywhere in attr
+        # (command, CRUD.o2, originatingCommand, etc.), not only attr.command.
+        attr = loaded_line.get("attr")
+        if attr and self.add_fields:
+            self._obfuscate_add_fields(attr)
 
         # Sort keys
         self._obfuscate_keys(loaded_line, "attr.command.sort")
