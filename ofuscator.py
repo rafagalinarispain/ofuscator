@@ -270,6 +270,7 @@ class Obfuscator:
         # opaque REDACTED_<hash> token instead of fruit/colour words.
         self.redact_namespaces = arg_redact_namespaces
         self.replacements = {}
+        self._ns_tokens = {}   # raw db/collection name -> REDACTED_<hash>
         self.logtype = self._get_logtype()
 
     def _use_char_replace_for_key(self, key=None):
@@ -446,6 +447,7 @@ class Obfuscator:
         the token is hash-based, not random).  Format: REDACTED_<8hex>.
         """
         token = 'REDACTED_' + hashlib.md5(part.encode()).hexdigest()[:8]
+        self._ns_tokens[part] = token
         # Store in replacements so other code can look it up if needed
         self.replacements.setdefault(part, token)
         return token
@@ -454,13 +456,17 @@ class Obfuscator:
         ns = self._get_by_path(data, path)
         if ns is None:
             return
+        if not isinstance(ns, str):
+            # e.g. findAndModify's "update" is a document, not a namespace
+            return
         if ns in ['local.oplog.rs', 'oplog.rs']:
             return
         parts = ns.split('.')
         replaced = []
         for i, part in enumerate(parts):
             if (i == 0 and part in ['system', 'local', 'admin', 'config']
-                    or part in ['$cmd']):
+                    or part in ['$cmd']
+                    or (self.redact_namespaces and part.startswith('REDACTED_'))):
                 replaced.append(part)
                 continue
             if self.redact_namespaces:
@@ -730,6 +736,83 @@ class Obfuscator:
             return command_obj
         return self._af_walk(command_obj)
 
+    # ── Namespace sweep (--redactNamespaces, any scope) ───────────────────────
+
+    _NS_KEYS = {'ns', 'namespace', 'nss', 'collection', 'fromNs', 'toNs',
+                'sourceNamespace', 'targetNamespace', 'nsName', 'fullns'}
+    _COLL_KEYS = {'find', 'aggregate', 'update', 'insert', 'delete',
+                  'findAndModify', 'findandmodify', 'distinct', 'count', 'create',
+                  'createIndexes', 'drop', 'dropIndexes', 'listIndexes', 'collMod',
+                  'validate', 'compact', 'killCursors', 'mapReduce', 'reIndex',
+                  'from', 'coll', 'collName', 'collectionName'}
+    _DB_KEYS = {'$db', 'db', 'dbName', 'database', 'dbname'}
+    _NS_KEEP_FIRST = {'system', 'local', 'admin', 'config'}
+
+    def _ns_string(self, ns, single=False):
+        if not isinstance(ns, str) or not ns or ns in ('local.oplog.rs', 'oplog.rs'):
+            return ns
+        if ns.startswith('REDACTED_'):
+            return ns
+        parts = [ns] if single else ns.split('.')
+        out = []
+        for i, part in enumerate(parts):
+            if part == '$cmd' or (i == 0 and part in self._NS_KEEP_FIRST) or not part:
+                out.append(part)
+            elif part.startswith('REDACTED_'):
+                out.append(part)
+            else:
+                out.append(self._redact_ns_part(part))
+        return '.'.join(out)
+
+    def _ns_sweep(self, obj, key=None):
+        """Redact db/collection names anywhere in the entry: by key name
+        (ns, namespace, $db, create, from, ...) and by any previously learned
+        raw name appearing as a whole value or inside a dotted namespace."""
+        if isinstance(obj, dict):
+            for k in list(obj.keys()):
+                v = obj[k]
+                if isinstance(v, str):
+                    if k in self._NS_KEYS and '.' in v:
+                        obj[k] = self._ns_string(v)
+                    elif k in self._NS_KEYS or k in self._COLL_KEYS:
+                        obj[k] = self._ns_string(v, single=True) if v not in ('', ) else v
+                    elif k in self._DB_KEYS:
+                        obj[k] = self._ns_string(v, single=True)
+                    else:
+                        obj[k] = self._ns_learned(v)
+                else:
+                    self._ns_sweep(v, key=k)
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                if isinstance(item, str):
+                    obj[i] = self._ns_learned(item)
+                else:
+                    self._ns_sweep(item, key=key)
+
+    def _ns_learned(self, text):
+        """Replace learned raw names: whole-value match, dotted ns, or inside
+        free text."""
+        if not self._ns_tokens or not text:
+            return text
+        if text in self._ns_tokens:
+            if len(text) < 3 or text in self._NS_KEEP_FIRST:
+                return text
+            return self._ns_tokens[text]
+        names = [n for n in self._ns_tokens
+                 if len(n) >= 3 and n not in self._NS_KEEP_FIRST and n in text]
+        if names:
+            names.sort(key=len, reverse=True)
+            pat = re.compile(r'(?<![\w])(' + '|'.join(re.escape(n) for n in names) + r')(?![\w])')
+            text = pat.sub(lambda m: self._ns_tokens[m.group(1)], text)
+        # "<redacted db>.<not yet seen collection>" inside free text
+        if 'REDACTED_' in text:
+            text = re.sub(r'(REDACTED_[0-9a-f]{8})\.([A-Za-z_][\w$]*)(?![\w$.(])',
+                          lambda m: m.group(1) + '.' + (
+                              m.group(2) if m.group(2).startswith('REDACTED_')
+                              or m.group(2) == '$cmd'
+                              else self._redact_ns_part(m.group(2))), text)
+        return text
+
     # ── JSON log processing ───────────────────────────────────────────────────
 
     def _process_json_line(self, loaded_line):
@@ -778,7 +861,7 @@ class Obfuscator:
             for cmd_path in [
                 "attr.command.q", "attr.command.u",
                 "attr.command.pipeline", "attr.command.filter",
-                "attr.command.query",
+                "attr.command.query", "attr.command.update",
             ]:
                 self._obfuscate_command_pii(loaded_line, cmd_path)
 
@@ -794,8 +877,13 @@ class Obfuscator:
             for cmd_path in [
                 "attr.command.q", "attr.command.u",
                 "attr.command.pipeline", "attr.command.filter",
-                "attr.command.query",
+                "attr.command.query", "attr.command.update",
             ]:
+                val = self._get_by_path(loaded_line, cmd_path)
+                # "update" is the collection name (str) for the update command
+                # but a document for findAndModify; only hash the document form.
+                if cmd_path.endswith('.update') and isinstance(val, str):
+                    continue
                 self._obfuscate_command(loaded_line, cmd_path)
 
         self._obfuscate_command(loaded_line, "attr.error.errmsg")
@@ -837,6 +925,11 @@ class Obfuscator:
 
         if self._get_by_path(loaded_line, 'attr.stats') is not None:
             self._obfuscate_stats(loaded_line)
+
+        # Namespace sweep last, so every name has been learned and nothing is
+        # redacted twice.
+        if self.redact_namespaces:
+            self._ns_sweep(loaded_line)
 
         return loaded_line
 
