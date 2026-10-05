@@ -255,6 +255,10 @@ class Obfuscator:
         self.seed = str(arg_seed) if arg_seed is not None else None
         self.pii = arg_pii
         self.add_fields = [f.strip() for f in (arg_add_fields or [])]
+        # Normalised names used for scope-independent matching
+        # ('$comment' / 'Comment' / 'comment' all become 'comment').
+        self._af_norm = set(self._af_normalize(f) for f in self.add_fields if f)
+        self._af_text_re = self._build_af_text_regex()
         self.char_replacement = arg_char_replacement
         # char_fields: only meaningful when char_replacement + seed are both set.
         # When char_fields is populated, x-pattern applies only to those fields;
@@ -409,10 +413,12 @@ class Obfuscator:
                               k.lower() in _PII_VALUE_KEYS or
                               bare in _PII_VALUE_KEYS or
                               bare.lower() in _PII_VALUE_KEYS or
-                              k in self.add_fields or
-                              bare in self.add_fields)
+                              self._af_key_matches(k))
                 if is_pii_key:
-                    obj[k] = self._obfuscate_value(obj[k], key=k)
+                    if self._af_key_matches(k):
+                        obj[k] = self._af_redact_deep(obj[k], key=k)
+                    else:
+                        obj[k] = self._obfuscate_value(obj[k], key=k)
                 elif isinstance(obj[k], (dict, list)):
                     self._walk_pii(obj[k])
         elif isinstance(obj, list):
@@ -591,30 +597,147 @@ class Obfuscator:
 
     # ── Command-level field obfuscation (--addFields) ─────────────────────────
 
+    # Comparison operators whose array form is [<"$fieldPath">, <literal>, ...]
+    _AF_CMP_OPS = {'$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in', '$nin',
+                   '$cmp'}
+
+    @staticmethod
+    def _af_normalize(name):
+        return str(name).strip().lstrip('$').lower()
+
+    def _af_key_matches(self, key):
+        """True if `key` (or any dotted/positional segment of it) is an addField.
+
+        Handles 'grId', '$comment', 'a.grId', 'arr.0.grId', 'a.$[e].grId',
+        'grId.sub' and is case-insensitive.
+        """
+        if not self._af_norm or not isinstance(key, str):
+            return False
+        if self._af_normalize(key) in self._af_norm:
+            return True
+        if '.' in key:
+            for seg in key.split('.'):
+                if self._af_normalize(seg) in self._af_norm:
+                    return True
+        return False
+
+    def _af_is_field_ref(self, value):
+        """True for aggregation field references such as '$grId' / '$a.grId'."""
+        return (isinstance(value, str) and value.startswith('$')
+                and not value.startswith('$$') and self._af_key_matches(value))
+
+    def _af_redact_deep(self, value, key=None):
+        """Redact EVERY scalar under `value`, including values nested in
+        operator documents ({"$in": [...]}, {"$gt": ...}, extended JSON)."""
+        if isinstance(value, dict):
+            return {k: self._af_redact_deep(v, key=key) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._af_redact_deep(v, key=key) for v in value]
+        if isinstance(value, str):
+            parsed = self._af_try_parse_json(value)
+            if parsed is not None:
+                return json.dumps(self._af_redact_deep(parsed, key=key))
+        return self._obfuscate_scalar(value, key=key)
+
+    @staticmethod
+    def _af_try_parse_json(text):
+        t = text.lstrip()
+        if not t or t[0] not in '{[':
+            return None
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, (dict, list)) else None
+
+    def _af_walk(self, obj):
+        """Mutate/return `obj`: redact addFields wherever they appear.
+
+        Scope-independent: works on any dict/list depth (commands, oplog
+        CRUD o/o2, originatingCommand, errors, ...), inside JSON that was
+        serialised into a string, in aggregation expressions like
+        {"$eq": ["$grId", "abc"]}, and in free text ("grId: abc").
+        """
+        if isinstance(obj, dict):
+            for k in list(obj.keys()):
+                v = obj[k]
+                if self._af_key_matches(k):
+                    obj[k] = self._af_redact_deep(v, key=k)
+                    continue
+                if k in self._AF_CMP_OPS and isinstance(v, list) and \
+                        any(self._af_is_field_ref(x) for x in v):
+                    obj[k] = [x if self._af_is_field_ref(x)
+                              else self._af_redact_deep(x, key=k) for x in v]
+                    continue
+                obj[k] = self._af_walk(v)
+            return obj
+        if isinstance(obj, list):
+            for i, item in enumerate(obj):
+                obj[i] = self._af_walk(item)
+            return obj
+        if isinstance(obj, str):
+            return self._af_walk_string(obj)
+        return obj
+
+    def _af_walk_string(self, text):
+        if not text:
+            return text
+        parsed = self._af_try_parse_json(text)
+        if parsed is not None:
+            return json.dumps(self._af_walk(parsed))
+        return self._af_redact_text(text)
+
+    # -- free-text handling ("grId: abc", "\"grId\": \"abc\"", grId=123) ------
+
+    def _build_af_text_regex(self):
+        names = sorted({re.escape(f.strip().lstrip('$')) for f in self.add_fields
+                        if f.strip()}, key=len, reverse=True)
+        if not names:
+            return None
+        value = (r'(?:\\"(?:(?!\\").)*\\"'            # \"escaped\" string
+                 r'|"(?:[^"\\]|\\.)*"'                 # "plain" string
+                 r"|'(?:[^'\\]|\\.)*'"                 # 'single' string
+                 r'|\{[^{}]*\}|\[[^\[\]]*\]'             # one-level {..} / [..]
+                 r'|[A-Za-z_]\w*\([^)]*\)'                # ObjectId("..") etc.
+                 r'|[^\s,}\]\)"\']+)')                    # bare token / number
+        pattern = (r'(?P<pre>(?<![\w])(?:\\?["\']?)\$?(?:' + '|'.join(names) +
+                   r')(?:\\?["\']?)\s*[:=]\s*)(?P<val>' + value + ')')
+        return re.compile(pattern, re.IGNORECASE | re.DOTALL)
+
+    def _af_text_value(self, val):
+        if val[:2] == '\\"' and val.endswith('\\"') and len(val) >= 4:
+            return '\\"' + str(self._af_redact_deep(val[2:-2])) + '\\"'
+        if val[:1] in ('"', "'") and val[-1:] == val[:1] and len(val) >= 2:
+            return val[0] + str(self._af_redact_deep(val[1:-1])) + val[0]
+        if val[:1] in '{[':
+            parsed = self._af_try_parse_json(val)
+            if parsed is not None:
+                return json.dumps(self._af_redact_deep(parsed))
+        if re.fullmatch(r'-?\d+(\.\d+)?', val):
+            num = float(val) if '.' in val else int(val)
+            return str(self._af_redact_deep(num))
+        return str(self._af_redact_deep(val))
+
+    def _af_redact_text(self, text):
+        if not self._af_text_re or not text:
+            return text
+        return self._af_text_re.sub(
+            lambda m: m.group('pre') + self._af_text_value(m.group('val')), text)
+
     def _obfuscate_add_fields(self, command_obj):
-        """
-        Walk the command object and obfuscate the values of fields listed
-        in self.add_fields (e.g. '$comment', '_tid').
-        """
-        if not self.add_fields or not isinstance(command_obj, dict):
-            return
-
-        def _walk(obj):
-            if isinstance(obj, dict):
-                for k in list(obj.keys()):
-                    if k in self.add_fields or k.split('.')[-1] in self.add_fields:
-                        obj[k] = self._obfuscate_value(obj[k], key=k)
-                    else:
-                        _walk(obj[k])
-            elif isinstance(obj, list):
-                for item in obj:
-                    _walk(item)
-
-        _walk(command_obj)
+        """Backwards-compatible wrapper around the scope-independent walk."""
+        if not self._af_norm:
+            return command_obj
+        return self._af_walk(command_obj)
 
     # ── JSON log processing ───────────────────────────────────────────────────
 
     def _process_json_line(self, loaded_line):
+        # --addFields: redact everywhere in the entry, whatever the scope
+        # (attr.command, attr.CRUD.o/o2, originatingCommand, msg, ...).
+        if self._af_norm:
+            loaded_line = self._af_walk(loaded_line)
+
         if "attr" not in loaded_line:
             return loaded_line
 
@@ -667,8 +790,6 @@ class Obfuscator:
                         for sub in ['q', 'u']:
                             if sub in upd:
                                 self._walk_pii(upd[sub])
-                        # addFields inside each update
-                        self._obfuscate_add_fields(upd)
         else:
             for cmd_path in [
                 "attr.command.q", "attr.command.u",
@@ -692,11 +813,9 @@ class Obfuscator:
                     )
                     self._set_by_path(loaded_line, err_path, redacted)
 
-        # --addFields: obfuscate specified fields anywhere in attr
-        # (command, CRUD.o2, originatingCommand, etc.), not only attr.command.
-        attr = loaded_line.get("attr")
-        if attr and self.add_fields:
-            self._obfuscate_add_fields(attr)
+        # --addFields: final sweep (catches anything re-created above)
+        if self._af_norm:
+            loaded_line = self._af_walk(loaded_line)
 
         # Sort keys
         self._obfuscate_keys(loaded_line, "attr.command.sort")
@@ -738,6 +857,7 @@ class Obfuscator:
                     self._replace_ip, line)
 
                 if self.logtype == LogType.TEXT:
+                    line = self._af_redact_text(line)
                     line = re.sub(r'".+?"', self._replace_string, line)
                     line = re.sub(
                         r'[a-zA-Z$][^ \t\n\r\f\v:\'"]+(\.[a-zA-Z$][^ \t\n\r\f\v:\'"]+)+',
