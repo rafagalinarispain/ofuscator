@@ -369,58 +369,93 @@ class LeakTests(unittest.TestCase):
         return out
 
     # -- flag matrix ---------------------------------------------------------
+    # The DEFAULT policy already is "deep PII + every literal + server-style": values of
+    # unlisted field names (STRICT_ONLY) are removed without any option.
     def test_default(self):
-        self.check([], ALWAYS)
+        self.check([], ALWAYS + STRICT_ONLY)
 
-    def test_pii(self):
-        self.check(['--pii'], ALWAYS)
+    def test_seed(self):
+        self.check(['--seed', 's1'], ALWAYS + STRICT_ONLY)
 
-    def test_pii_seed(self):
-        self.check(['--pii', '--seed', 's1'], ALWAYS)
+    def test_redact_namespaces(self):
+        self.check(['--redactNamespaces'], ALWAYS + STRICT_ONLY)
 
-    def test_pii_redact_namespaces(self):
-        self.check(['--pii', '--redactNamespaces'], ALWAYS)
+    def test_char_replacement(self):
+        self.check(['--char_replacement'], ALWAYS + STRICT_ONLY)
 
-    def test_default_redact_namespaces(self):
-        self.check(['--redactNamespaces'], ALWAYS)
-
-    def test_pii_char_replacement(self):
-        self.check(['--pii', '--char_replacement'], ALWAYS)
+    def test_single_pass(self):
+        self.check(['--single_pass'], ALWAYS + STRICT_ONLY)
 
     def test_everything(self):
-        self.check(['--pii', '--seed', 'k', '--char_replacement',
-                    '--redactNamespaces', '--addFields', '$comment,_tid'],
-                   ALWAYS)
+        self.check(['--seed', 'k', '--char_replacement', '--redactNamespaces',
+                    '--addFields', '$comment,_tid'], ALWAYS + STRICT_ONLY)
 
-    def test_strict(self):
-        self.check(['--pii', '--strict'], ALWAYS + STRICT_ONLY)
-
-    def test_strict_full(self):
-        self.check(['--pii', '--strict', '--seed', 'k', '--char_replacement',
-                    '--redactNamespaces'], ALWAYS + STRICT_ONLY)
+    def test_deprecated_flags_are_accepted_and_ignored(self):
+        """--pii / --strict / --server_redaction / --redactClientLogData are the default
+        policy now: hidden from --help, accepted, no effect on the output."""
+        base = self.run_tool('--seed', 'z')
+        self.assertEqual(base.returncode, 0)
+        self.assertNotIn('ignored', base.stderr)
+        for flags in (['--pii'], ['--strict'], ['--server_redaction'],
+                      ['--redactClientLogData'], ['--pii', '--strict', '--server_redaction']):
+            r = self.run_tool(*flags, '--seed', 'z')
+            self.assertEqual(r.returncode, 0, (flags, r.stderr[-300:]))
+            self.assertEqual(r.stdout, base.stdout, flags)          # identical output
+            self.assertIn('ignored', r.stderr)                      # one-line note
+            self.assertIn('default policy', r.stderr)
+            self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        h = subprocess.run([sys.executable, SCRIPT, '--help'], capture_output=True, text=True).stdout
+        for flag in ('--pii', '--strict', '--server_redaction', '--redactClientLogData'):
+            self.assertNotIn(flag + ' ', h.replace('\n', ' ') + ' ')
 
     # -- behaviour / robustness ---------------------------------------------
     def test_structure_preserved(self):
-        out = self.check(['--pii'], ALWAYS)
+        out = self.check([], ALWAYS)
         first = json.loads(out.splitlines()[0])
         for k in ("t", "s", "c", "ctx", "id", "msg", "attr"):
             self.assertIn(k, first)
         self.assertEqual(first["attr"]["durationMillis"], 7)
-        self.assertEqual(first["attr"]["command"]["limit"], 5)
+        self.assertEqual(first["attr"]["keysExamined"], 1)         # counters are not client data
+        self.assertEqual(first["attr"]["command"]["limit"], "###")   # server masks every literal
+        self.assertEqual(set(first["attr"]["command"]["filter"]["identity"]["ssn"]), {"$in"})  # operators kept
         self.assertEqual(first["id"], 51803)
         self.assertEqual(first["msg"], "Slow query")
 
     def test_deterministic_with_seed(self):
-        a = self.run_tool('--pii', '--seed', 'abc').stdout
-        b = self.run_tool('--pii', '--seed', 'abc').stdout
+        a = self.run_tool('--seed', 'abc').stdout
+        b = self.run_tool('--seed', 'abc').stdout
         self.assertEqual(a, b)
+
+    def test_seed_gives_the_same_words_across_files_order_and_options(self):
+        """With --seed a value maps to the same fruit / colour in EVERY file, whatever the
+        order, the other content and the other options (the words come from an HMAC of the
+        value, not from a shared random stream)."""
+        mk = lambda ns, app: L("COMMAND", "c", 1, "Slow query", {"ns": ns, "appName": app,
+                                                                 "user": "jane.roe", "host": "h1.acme.net:27017"})
+        fa = os.path.join(self.tmp.name, 'fa.log')
+        fb = os.path.join(self.tmp.name, 'fb.log')
+        with open(fa, 'w') as fh:
+            for e in (mk("shop.customers", "AcmeApp"), mk("shop.orders", "AcmeApp")):
+                fh.write(json.dumps(e) + '\n')
+        with open(fb, 'w') as fh:                       # other content, other order
+            for e in (mk("zzz.first", "Other"), mk("a.b", "Third"), mk("shop.customers", "AcmeApp")):
+                fh.write(json.dumps(e) + '\n')
+        def attr(path, line, *flags):
+            return json.loads(self.run_tool(*flags, '--seed', 'k', path=path).stdout.splitlines()[line])['attr']
+        a = attr(fa, 0)
+        for flags in ([], ['--addFields', 'whatever'], ['--single_pass'], ['--char_fields', 'x']):
+            b = attr(fb, 2, *flags)
+            for key in ('ns', 'appName', 'user', 'host'):
+                self.assertEqual(a[key], b[key], (key, flags))
+        c = json.loads(self.run_tool('--seed', 'other', path=fa).stdout.splitlines()[0])['attr']
+        self.assertNotEqual(a['ns'], c['ns'])           # a different seed gives different words
 
     def test_leading_blank_line_still_json(self):
         p = os.path.join(self.tmp.name, 'blank_first.log')
         with open(p, 'w') as fh:
             fh.write('\n')
             fh.write(json.dumps(self.entries[0]) + '\n')
-        out = self.run_tool('--pii', path=p).stdout
+        out = self.run_tool(path=p).stdout
         for c in ALWAYS:
             self.assertNotIn(c, out)
         self.assertIn('"attr"', out)
@@ -433,7 +468,7 @@ class LeakTests(unittest.TestCase):
             fh.write('{"t":{"$date":"x"},"msg":"cut off alice.smith@acme-corp.com 10.20.30.40 "attr":{\n')
             fh.write('Oct  7 host mongod[1]: ' + good + '\n')     # syslog prefix
             fh.write(good + '\n')
-        p_ = self.run_tool('--pii', path=p)
+        p_ = self.run_tool(path=p)
         self.assertEqual(p_.returncode, 0, p_.stderr[-1500:])
         for c in ALWAYS:
             self.assertNotIn(c, p_.stdout)
@@ -451,7 +486,7 @@ class LeakTests(unittest.TestCase):
             fh.write(json.dumps(self.entries[0]) + '\n')
             fh.write('["alice.smith@acme-corp.com"]\n')
             fh.write('"10.20.30.40"\n')
-        p_ = self.run_tool('--pii', path=p)
+        p_ = self.run_tool(path=p)
         self.assertEqual(p_.returncode, 0, p_.stderr[-1500:])
         self.assertNotIn('alice.smith', p_.stdout)
         self.assertNotIn('10.20.30.40', p_.stdout)
@@ -460,7 +495,7 @@ class LeakTests(unittest.TestCase):
 
     def test_no_unsalted_md5_of_low_entropy_values(self):
         import hashlib
-        out = self.run_tool('--pii').stdout
+        out = self.run_tool().stdout
         for v in ('987654321', '123-45-6789', '4111111111111111'):
             self.assertNotIn(hashlib.md5(v.encode()).hexdigest(), out)
         out = self.run_tool().stdout        # default: hashed blobs
@@ -475,7 +510,7 @@ class LeakTests(unittest.TestCase):
         self.assertIn('REDACTED_', out)
 
     def test_system_namespaces_preserved(self):
-        out = self.run_tool('--pii', '--redactNamespaces').stdout
+        out = self.run_tool('--redactNamespaces').stdout
         self.assertIn('local.oplog.rs', out)
 
     # -- x-pattern must follow exactly the same rules as fruit-salad ---------
@@ -523,17 +558,11 @@ class LeakTests(unittest.TestCase):
     def test_parity_default(self):
         self._parity()
 
-    def test_parity_pii(self):
-        self._parity('--pii')
-
-    def test_parity_strict(self):
-        self._parity('--strict')
-
-    def test_parity_pii_redact_namespaces(self):
-        self._parity('--pii', '--redactNamespaces')
+    def test_parity_redact_namespaces(self):
+        self._parity('--redactNamespaces')
 
     def test_char_fields_selective_keeps_coverage(self):
-        out = self.check(['--pii', '--seed', 's', '--char_replacement',
+        out = self.check(['--seed', 's', '--char_replacement',
                           '--char_fields', 'emails,email,$comment,user'],
                          ALWAYS)
         self.assertIn('@', out)       # fruit@colour.com style still used elsewhere
@@ -547,7 +576,7 @@ class LeakTests(unittest.TestCase):
                      'planSummary: IXSCAN { email: 1 } 10.20.30.40:5555 protocol:op_msg 12ms\n')
             fh.write('2019-03-01T10:00:02.000+0000 I ACCESS [conn8] Successfully authenticated '
                      'as principal jsmith_admin on admin from client db-prod-01.internal.acme.com:27017\n')
-        for flags in ([], ['--char_replacement'], ['--pii', '--redactNamespaces']):
+        for flags in ([], ['--char_replacement'], ['--redactNamespaces']):
             out = self.run_tool(*flags, path=p).stdout
             for c in ('alice.smith@acme-corp.com', '123456789', '10.20.30.40',
                       'jsmith_admin', 'db-prod-01.internal.acme.com',
@@ -558,7 +587,7 @@ class LeakTests(unittest.TestCase):
 
     def test_benign_fields_not_corrupted(self):
         """Learned-name replacement must not damage unrelated attributes."""
-        out = self.run_tool('--pii', '--seed', 'k').stdout.splitlines()
+        out = self.run_tool('--seed', 'k').stdout.splitlines()
         for ln in out:
             e = json.loads(ln)
             a = e.get('attr', {})
@@ -568,7 +597,8 @@ class LeakTests(unittest.TestCase):
                 self.assertEqual(e['msg'], 'Slow query')
         crud = [json.loads(x)['attr']['CRUD'] for x in out
                 if 'CRUD' in json.loads(x).get('attr', {})][0]
-        self.assertEqual(crud['op'], 'u')
+        self.assertEqual(set(crud), {'op', 'ns', 'o', 'o2'})     # keys kept, like the server
+        self.assertEqual(crud['op'], '###')                      # the server masks the op too
 
     def test_renamed_keys_never_collide_or_drop_fields(self):
         """Different field names can obfuscate to the same word / x-pattern:
@@ -582,7 +612,7 @@ class LeakTests(unittest.TestCase):
         p = os.path.join(self.tmp.name, 'collide.log')
         with open(p, 'w') as fh:
             fh.write(json.dumps(ent) + '\n')
-        for flags in ([], ['--char_replacement'], ['--pii'], ['--pii', '--char_replacement']):
+        for flags in ([], ['--char_replacement'], [], ['--char_replacement']):
             cmd = json.loads(self.run_tool(*flags, path=p).stdout)['attr']['command']
             self.assertEqual(len(cmd['sort']), len(sort), flags)
             self.assertEqual(len(cmd['hint']), len(hint), flags)
@@ -595,7 +625,7 @@ class LeakTests(unittest.TestCase):
         p = os.path.join(self.tmp.name, 'af.log')
         with open(p, 'w') as fh:
             fh.write(json.dumps(ent) + '\n')
-        out = self.run_tool('--pii', '--addFields', 'grId', path=p).stdout
+        out = self.run_tool('--addFields', 'grId', path=p).stdout
         self.assertNotIn('zzz-grid-canary', out)
 
 
@@ -655,8 +685,7 @@ class ServerPolicyTests(unittest.TestCase):
         return json.loads(r.stdout.splitlines()[0])['attr']
 
     # ---- S1: BinData Encrypt (6) / Sensitive (8): masked by DEFAULT -------------------
-    FLAGS = ([], ['--pii'], ['--strict'], ['--pii', '--char_replacement'],
-             ['--server_redaction'])
+    FLAGS = ([], ['--char_replacement'], ['--redactNamespaces'], ['--seed', 'k'])
 
     def test_s1_bindata_6_and_8_masked_in_every_context(self):
         b6, b8, b0 = binary(B64_6, 6), binary(B64_8, 8), binary(B64_0, 0)
@@ -674,7 +703,7 @@ class ServerPolicyTests(unittest.TestCase):
                 self.assertNotIn(canary, out, (flags, canary))
 
     def test_s1_mask_is_the_server_mask_and_replaces_the_whole_element(self):
-        for flags in ([], ['--pii'], ['--pii', '--char_replacement']):
+        for flags in ([], [], ['--char_replacement']):
             a = self.run_attr({"generic": {"a": binary(B64_6, 6), "b": binary(B64_8, 8)}}, *flags)
             self.assertEqual(a["generic"], {"a": MASK, "b": MASK}, flags)
 
@@ -683,8 +712,7 @@ class ServerPolicyTests(unittest.TestCase):
         only BinData 6/8 change, siblings (`string: "string"`) stay."""
         a = self.run_attr({"generic": {"type6": binary(B64_6, 6), "string": "string",
                                        "general": binary(B64_0, 0),
-                                       "uuid": {"$binary": {"base64": "AAAAAAAAAAAAAAAAAAAAAA==", "subType": "04"}}}},
-                          '--pii')
+                                       "uuid": {"$binary": {"base64": "AAAAAAAAAAAAAAAAAAAAAA==", "subType": "04"}}}})
         g = a["generic"]
         self.assertEqual(g["type6"], MASK)
         self.assertEqual(g["string"], "string")
@@ -693,7 +721,7 @@ class ServerPolicyTests(unittest.TestCase):
 
     def test_s1_legacy_extended_json_form(self):
         a = self.run_attr({"generic": {"old": {"$binary": B64_8, "$type": "08"},
-                                       "old0": {"$binary": B64_0, "$type": "00"}}}, '--pii')
+                                       "old0": {"$binary": B64_0, "$type": "00"}}})
         self.assertEqual(a["generic"]["old"], MASK)
         self.assertNotEqual(a["generic"]["old0"], MASK)
 
@@ -701,7 +729,7 @@ class ServerPolicyTests(unittest.TestCase):
     def test_s2_payload_documents_erase_bool_null_and_flag_ints(self):
         doc = {"optedOut": False, "hivStatus": True, "n": None, "flag": 1, "zero": 0,
                "neg": -1, "age": 42, "ratio": 0.5, "name": "nm-canary", "nested": [True, None, 1]}
-        for flags in (['--pii'], ['--pii', '--char_replacement'], ['--strict']):
+        for flags in ([], ['--char_replacement'], []):
             a = self.run_attr({"command": {"insert": "c", "documents": [doc], "$db": "d"}}, *flags)
             got = a["command"]["documents"][0]
             for k, orig in doc.items():
@@ -709,33 +737,34 @@ class ServerPolicyTests(unittest.TestCase):
             self.assertEqual(got["nested"], [MASK, MASK, got["nested"][2]])
             self.assertNotEqual(got["nested"][2], 1)
 
-    def test_s2_query_structure_is_not_erased_but_pii_bool_is(self):
-        a = self.run_attr({"command": {
-            "aggregate": "c", "cursor": {}, "$db": "d",
-            "pipeline": [{"$project": {"email": 1, "phone": True, "_id": 0}},
-                         {"$sort": {"createdAt": -1}},
-                         {"$group": {"_id": None, "n": {"$sum": 1}}},
-                         {"$match": {"hivStatus": True, "status": "x"}}]}}, '--pii')
-        pl = a["command"]["pipeline"]
-        self.assertEqual(pl[0]["$project"], {"email": 1, "phone": True, "_id": 0})
-        self.assertEqual(pl[1]["$sort"], {"createdAt": -1})
-        self.assertEqual(pl[2]["$group"], {"_id": None, "n": {"$sum": 1}})
-        self.assertEqual(pl[3]["$match"]["hivStatus"], MASK)          # health flag erased
+    def test_default_keeps_keys_and_operators_but_masks_every_literal(self):
+        """Same as the server with redactClientLogData=true (BSON level `all`): stage names,
+        operators and field names stay, EVERY literal becomes ###, flags and nulls included."""
+        for flags in ([], ['--char_replacement']):
+            a = self.run_attr({"command": {
+                "aggregate": "c", "cursor": {}, "$db": "d",
+                "pipeline": [{"$project": {"email": 1, "phone": True, "_id": 0}},
+                             {"$sort": {"createdAt": -1}},
+                             {"$group": {"_id": None, "n": {"$sum": 1}}},
+                             {"$match": {"hivStatus": True, "status": "x"}}]}}, *flags)
+            pl = a["command"]["pipeline"]
+            self.assertEqual(pl[0]["$project"], {"email": MASK, "phone": MASK, "_id": MASK})
+            self.assertEqual(pl[1]["$sort"], {"createdAt": MASK})
+            self.assertEqual(pl[2]["$group"], {"_id": MASK, "n": {"$sum": MASK}})
+            self.assertEqual(pl[3]["$match"], {"hivStatus": MASK, "status": MASK})
+            self.assertEqual([list(st)[0] for st in pl], ["$project", "$sort", "$group", "$match"])
 
-    def test_s2_builtin_pii_ref_inside_operand_array(self):
-        """{"$in": [<value>, ["$email"]]}: the literal is compared with a PII field."""
-        a = self.run_attr({"command": {"aggregate": "c", "cursor": {}, "$db": "d", "pipeline": [
-            {"$match": {"$expr": {"$in": ["in-operand-canary-77", ["$email"]]}}}]}}, '--pii')
+    def test_default_builtin_pii_ref_inside_operand_array(self):
+        a = self.run_attr({"check": {"$in": ["in-operand-canary-77", ["$email"]]}})
         self.assertNotIn("in-operand-canary-77", json.dumps(a))
 
-    def test_s2_update_options_are_kept(self):
+    def test_default_masks_update_options_like_the_server(self):
         a = self.run_attr({"command": {"update": "c", "$db": "d", "ordered": True,
                                        "updates": [{"q": {"ssn": "123-45-6789"}, "u": {"$set": {"a": 1}},
-                                                    "multi": False, "upsert": True}]}}, '--strict')
+                                                    "multi": False, "upsert": True}]}})
         u = a["command"]["updates"][0]
-        self.assertIs(u["multi"], False)
-        self.assertIs(u["upsert"], True)
-        self.assertNotEqual(u["q"]["ssn"], "123-45-6789")
+        self.assertEqual(u, {"q": {"ssn": MASK}, "u": {"$set": {"a": MASK}}, "multi": MASK, "upsert": MASK})
+        self.assertEqual(a["command"]["ordered"], MASK)
 
     # ---- idempotence on logs the server already redacted ----------------------------------
     SERVER_REDACTED = {
@@ -748,9 +777,9 @@ class ServerPolicyTests(unittest.TestCase):
     }
 
     def test_idempotent_on_server_redacted_logs_every_mode(self):
-        for flags in ([], ['--pii'], ['--strict'], ['--pii', '--char_replacement'],
-                      ['--pii', '--redactNamespaces'], ['--server_redaction'],
-                      ['--server_redaction', '--char_replacement']):
+        for flags in ([], [], [], ['--char_replacement'],
+                      ['--redactNamespaces'], [],
+                      ['--char_replacement']):
             a = self.run_attr(self.SERVER_REDACTED, *flags)
             for key in ("command", "error", "exception", "errMsg"):
                 self.assertEqual(a[key], self.SERVER_REDACTED[key], (flags, key))
@@ -771,7 +800,7 @@ class ServerPolicyTests(unittest.TestCase):
 
     def test_server_redaction_matches_server_unit_tests(self):
         for src, want in self.SERVER_TEST_CASES:
-            for flags in (['--server_redaction'], ['--server_redaction', '--char_replacement']):
+            for flags in ([], ['--char_replacement']):
                 a = self.run_attr({"command": {"find": "c", "filter": src, "$db": "d"}}, *flags)
                 self.assertEqual(a["command"]["filter"], want, (src, flags))
 
@@ -796,7 +825,7 @@ class ServerPolicyTests(unittest.TestCase):
         ]
         for cmd in commands:
             want = server_redact_all(cmd)
-            for flags in (['--server_redaction'], ['--server_redaction', '--char_replacement']):
+            for flags in ([], ['--char_replacement']):
                 got = self.run_attr({"command": cmd}, *flags)["command"]
                 self.assertEqual(got, want, (list(cmd)[0], flags))
 
@@ -805,7 +834,7 @@ class ServerPolicyTests(unittest.TestCase):
         (index and field names); this tool never does."""
         cmd = {"find": "c", "filter": {"a": 1}, "sort": {"notes_secret_index": -1},
                "hint": {"ssn_lookup_idx": 1}, "projection": {"identity.ssn": 1}, "$db": "d"}
-        for flags in (['--server_redaction'], ['--server_redaction', '--char_replacement']):
+        for flags in ([], ['--char_replacement']):
             got = self.run_attr({"command": cmd}, *flags)["command"]
             blob = json.dumps(got)
             for name in ("notes_secret_index", "ssn_lookup_idx", "identity.ssn"):
@@ -819,8 +848,7 @@ class ServerPolicyTests(unittest.TestCase):
                  "o": {"$v": 2, "diff": {"u": {"email": "a@b.com"}}}, "o2": {"_id": "C-1"},
                  "ts": {"$timestamp": {"t": 1, "i": 1}}, "t": 1, "wall": {"$date": "2026-10-07T00:00:00Z"}}
         a = self.run_attr({"CRUD": entry, "keyValue": {"email": "a@b.com"},
-                           "errInfo": {"failingDocumentId": "C-9", "details": {"x": "y"}}},
-                          '--server_redaction')
+                           "errInfo": {"failingDocumentId": "C-9", "details": {"x": "y"}}})
         self.assertEqual(a["CRUD"]["o"], server_redact_all(entry["o"]))
         self.assertEqual(a["CRUD"]["o2"], {"_id": MASK})
         self.assertEqual(a["keyValue"], {"email": MASK})
@@ -841,21 +869,20 @@ class ServerPolicyTests(unittest.TestCase):
             "InternalError " + MASK: "InternalError " + MASK,  # redact(DBException), already masked
         }
         for text, want in cases.items():
-            a = self.run_attr({"error": text}, '--server_redaction')
+            a = self.run_attr({"error": text})
             self.assertEqual(a["error"], want, text)
 
     def test_server_redaction_structured_status_keeps_code_drops_reason(self):
         a = self.run_attr({"error": {"code": 13, "codeName": "Unauthorized",
-                                     "errmsg": "not authorized on acmeshopdb to execute command"}},
-                          '--server_redaction')
+                                     "errmsg": "not authorized on acmeshopdb to execute command"}})
         self.assertEqual(a["error"], {"code": 13, "codeName": "Unauthorized", "errmsg": MASK})
 
     def test_server_redaction_mask_ignores_char_replacement_and_keeps_other_rules(self):
         attr = {"ns": "acmeshopdb.customers", "appName": "AcmeApp", "remote": "10.20.30.40:5555",
                 "command": {"find": "customers", "filter": {"email": "a@b.com"}, "$db": "acmeshopdb"},
                 "error": "Unauthorized: boom"}
-        word = self.run_attr(attr, '--server_redaction')
-        xpat = self.run_attr(attr, '--server_redaction', '--char_replacement')
+        word = self.run_attr(attr)
+        xpat = self.run_attr(attr, '--char_replacement')
         self.assertEqual(word["command"], xpat["command"])            # "###" in both styles
         self.assertEqual(word["error"], xpat["error"])
         for a in (word, xpat):                                        # extra rules still apply
@@ -869,8 +896,8 @@ class ServerPolicyTests(unittest.TestCase):
         with open(p, 'w') as fh:
             for ent in build_entries():
                 fh.write(json.dumps(ent) + '\n')
-        for flags in (['--server_redaction'], ['--server_redaction', '--char_replacement'],
-                      ['--redactClientLogData', '--redactNamespaces', '--seed', 'k']):
+        for flags in ([], ['--char_replacement'],
+                      ['--redactNamespaces', '--seed', 'k']):
             r = subprocess.run([sys.executable, SCRIPT, '--log_redact', p, *flags],
                                capture_output=True, text=True, timeout=300)
             self.assertEqual(r.returncode, 0, r.stderr[-400:])
@@ -881,12 +908,14 @@ class ServerPolicyTests(unittest.TestCase):
             leaked = [c for c in ALWAYS + STRICT_ONLY if c in r.stdout]
             self.assertEqual(leaked, [], (flags, leaked))
 
-    def test_server_redaction_rejected_for_ftdc(self):
-        r = subprocess.run([sys.executable, SCRIPT, '--ftdc_redact', '--input_dir', self.tmp.name,
-                            '--output_dir', self.tmp.name + '/o', '--server_redaction'],
-                           capture_output=True, text=True)
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn('only valid with --log_redact', r.stderr)
+    def test_log_only_options_rejected_for_ftdc(self):
+        for opt in (['--seed', 'x'], ['--redactNamespaces'], ['--char_replacement'],
+                    ['--addFields', 'a']):
+            r = subprocess.run([sys.executable, SCRIPT, '--ftdc_redact', '--input_dir', self.tmp.name,
+                                '--output_dir', self.tmp.name + '/o', *opt],
+                               capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0, opt)
+            self.assertIn('only valid with --log_redact', r.stderr)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -907,48 +936,58 @@ SCHEMA_DOC = {"fields": ["tenantRef"],
 
 
 def schema_corpus():
-    """One entry per CONTEXT in which a field can show up."""
+    """One entry per CONTEXT in which a field can show up OUTSIDE client data.
+    (Client data - commands, filters, documents, oplog entries - is masked by the DEFAULT
+    policy whatever the options are; the schema / --addFields rules extend the default to
+    every other place, see test_client_data_is_always_masked_whatever_the_options.)"""
     E = []
-    cmd = lambda c: {"type": "command", "ns": "shop.cust", "command": dict(c, **{"$db": "shop"})}
-    # 1 generic attr outside any command (default, non --pii mode must still redact it)
+    # 1 generic attrs
     E.append(L("COMMAND", "c1", 1, "generic attrs", {
         "email": CAN_DEFAULT, "grId": CAN_ADD, "tenantRef": CAN_SCHEMA,
         "customer": {"vipCode": CAN_PATH, "name_": "n"}, "vendor": {"vipCode": CAN_KEEP},
         "loyalty": {"tier": CAN_NESTED}}))
-    # 2 filter (dotted keys, nested objects, operator wrappers, arrays)
-    E.append(L("COMMAND", "c2", 2, "Slow query", cmd({"find": "cust", "filter": {
+    # 2 query-shaped document in a container the server does not treat as client data
+    E.append(L("COMMAND", "c2", 2, "query shaped", {"ctxFilter": {
         "email": CAN_DEFAULT, "grId": CAN_ADD, "tenantRef": {"$in": [CAN_SCHEMA]},
         "customer.vipCode": CAN_PATH, "loyalty": {"tier": CAN_NESTED},
-        "vendor.vipCode": CAN_KEEP}})))
-    E.append(L("COMMAND", "c3", 3, "Slow query", cmd({"find": "cust", "filter": {
+        "vendor.vipCode": CAN_KEEP}}))
+    E.append(L("COMMAND", "c3", 3, "elemMatch", {"ctxFilter": {
         "customer": {"$elemMatch": {"vipCode": CAN_PATH}},
-        "vendor": {"$elemMatch": {"vipCode": CAN_KEEP}}}})))
-    E.append(L("COMMAND", "c4", 4, "Slow query", cmd({"find": "cust", "filter": {
-        "customer": [{"vipCode": CAN_PATH}, {"vipCode": CAN_PATH + "-2"}]}})))
-    # 3 update with $set on dotted paths + positional operator
-    E.append(L("COMMAND", "c5", 5, "Slow query", cmd({"update": "cust", "updates": [{
-        "q": {"email": CAN_DEFAULT},
-        "u": {"$set": {"customer.vipCode": CAN_PATH, "customer.items.$[e].vipCode": CAN_DEEP,
-                       "grId": CAN_ADD, "tenantRef": CAN_SCHEMA, "loyalty.tier": CAN_NESTED,
-                       "vendor.vipCode": CAN_KEEP}}, "multi": False}]})))
-    # 4 aggregation comparison against a field reference
-    E.append(L("COMMAND", "c6", 6, "Slow query", cmd({"aggregate": "cust", "cursor": {}, "pipeline": [
-        {"$match": {"$expr": {"$eq": ["$grId", CAN_ADD]}}},
-        {"$match": {"$expr": {"$eq": ["$tenantRef", CAN_SCHEMA]}}},
-        {"$match": {"$expr": {"$eq": ["$customer.vipCode", CAN_PATH]}}},
-        {"$match": {"$expr": {"$eq": ["$vendor.vipCode", CAN_KEEP]}}}]})))
-    # 5 oplog applier entry / payload document
-    E.append(L("REPL", "c7", 7, "applied op", {"CRUD": {"op": "i", "ns": "shop.cust", "o": {
-        "_id": 1, "grId": CAN_ADD, "tenantRef": CAN_SCHEMA,
-        "customer": {"vipCode": CAN_PATH}, "loyalty": {"tier": CAN_NESTED}}}}))
+        "vendor": {"$elemMatch": {"vipCode": CAN_KEEP}}}}))
+    E.append(L("COMMAND", "c4", 4, "arrays", {"ctxFilter": {
+        "customer": [{"vipCode": CAN_PATH}, {"vipCode": CAN_PATH + "-2"}]}}))
+    # 3 update operators on dotted / positional paths
+    E.append(L("COMMAND", "c5", 5, "set", {"ctxUpdate": {
+        "$set": {"customer.vipCode": CAN_PATH, "customer.items.$[e].vipCode": CAN_DEEP,
+                 "grId": CAN_ADD, "tenantRef": CAN_SCHEMA, "loyalty.tier": CAN_NESTED,
+                 "vendor.vipCode": CAN_KEEP}}}))
+    # 4 comparisons against field references
+    E.append(L("COMMAND", "c6", 6, "refs", {"check": [
+        {"$eq": ["$grId", CAN_ADD]},
+        {"$eq": ["$tenantRef", CAN_SCHEMA]},
+        {"$eq": ["$customer.vipCode", CAN_PATH]},
+        {"$eq": ["$vendor.vipCode", CAN_KEEP]}]}))
+    # 5 a sub-document
+    E.append(L("REPL", "c7", 7, "doc", {"ctxDoc": {
+        "_": 1, "grId": CAN_ADD, "tenantRef": CAN_SCHEMA,
+        "customer": {"vipCode": CAN_PATH}, "loyalty": {"tier": CAN_NESTED}}}))
     # 6 JSON serialised inside a string
     E.append(L("COMMAND", "c8", 8, "embedded", {"blob": json.dumps({
         "grId": CAN_ADD, "tenantRef": CAN_SCHEMA, "customer": {"vipCode": CAN_PATH},
         "vendor": {"vipCode": CAN_KEEP}})}))
-    # 7 free text error message
-    E.append(L("COMMAND", "c9", 9, "Slow query", {"type": "command", "ns": "shop.cust",
-        "errMsg": f"bad value tenantRef: {CAN_SCHEMA} and grId: {CAN_ADD}"}))
+    # 7 free text
+    E.append(L("COMMAND", "c9", 9, "free text", {
+        "freeText": f"bad value tenantRef: {CAN_SCHEMA} and grId: {CAN_ADD}"}))
     return E
+
+
+def client_data_entry():
+    """The same values inside real client data (a command)."""
+    return L("COMMAND", "c10", 10, "Slow query", {"type": "command", "ns": "shop.cust", "command": {
+        "find": "cust", "$db": "shop", "filter": {
+            "email": CAN_DEFAULT, "grId": CAN_ADD, "tenantRef": CAN_SCHEMA,
+            "customer.vipCode": CAN_PATH, "loyalty": {"tier": CAN_NESTED},
+            "vendor.vipCode": CAN_KEEP, "customer.items.$[e].vipCode": CAN_DEEP}}})
 
 
 COMBOS = {              # label -> (uses schema file, uses --addFields)
@@ -1001,71 +1040,100 @@ class SchemaFileTests(unittest.TestCase):
 
     # ---- the rule, for every option combination x style x mode --------------------------
     def test_rule_matrix(self):
+        """none -> default | schema -> default+schema | addFields -> default+fields |
+        both -> default+schema+fields, in fruit and in x style."""
         for combo in COMBOS:
             for style in ([], ['--char_replacement']):
-                for mode in (['--pii'], ['--strict'], []):
-                    flags = self.flags_for(combo, *mode, *style)
-                    r = self.run_tool(*flags)
-                    self.assertEqual(r.returncode, 0, (flags, r.stderr[-300:]))
-                    out = r.stdout
-                    for ln in out.splitlines():
-                        json.loads(ln)
-                    gone = self.expected_gone(combo)
-                    for c in self.ALL:
-                        if mode == []:
-                            # default (non --pii) mode hashes command blobs: judge the
-                            # top-level attr entry only (the `generic attrs` line)
-                            first = out.splitlines()[0]
-                            if c not in first and c not in SRC_FIRST_LINE:
-                                continue
-                            seen = c in first
-                        else:
-                            seen = c in out
-                        if c in gone:
-                            self.assertFalse(seen, f'LEAK {c!r} with {combo} {mode} {style}')
-                        elif mode != ['--strict']:
-                            # not asked for -> the DEFAULT rules only: value stays visible
-                            self.assertTrue(seen, f'{c!r} wrongly redacted with {combo} {mode} {style}')
+                flags = self.flags_for(combo, *style)
+                r = self.run_tool(*flags)
+                self.assertEqual(r.returncode, 0, (flags, r.stderr[-300:]))
+                out = r.stdout
+                for ln in out.splitlines():
+                    json.loads(ln)
+                gone = self.expected_gone(combo)
+                for c in self.ALL:
+                    if c in gone:
+                        self.assertNotIn(c, out, f'LEAK {c!r} with {combo} {style}')
+                    else:                 # not asked for -> the DEFAULT rules only: stays visible
+                        self.assertIn(c, out, f'{c!r} wrongly redacted with {combo} {style}')
+                self.assertIn(CAN_KEEP, out)         # never matched by any rule of any combination
+
+    def test_client_data_is_always_masked_whatever_the_options(self):
+        """Inside a command the default policy already masks every literal, so all four
+        combinations give the same client-data result; the schema only adds reach."""
+        p = os.path.join(self.tmp.name, 'client.log')
+        with open(p, 'w') as fh:
+            fh.write(json.dumps(client_data_entry()) + '\n')
+        outs = set()
+        for combo in COMBOS:
+            for style in ([], ['--char_replacement']):
+                r = self.run_tool(*self.flags_for(combo, *style), log=p)
+                self.assertEqual(r.returncode, 0, r.stderr[-300:])
+                for c in self.ALL + [CAN_KEEP]:
+                    self.assertNotIn(c, r.stdout, (combo, style, c))
+                filt = json.loads(r.stdout)['attr']['command']['filter']
+                leaves = []
+                walk = lambda n: ([walk(x) for x in n.values()] if isinstance(n, dict)
+                                  else [walk(x) for x in n] if isinstance(n, list) else leaves.append(n))
+                walk(filt)
+                self.assertEqual(set(leaves), {MASK}, (combo, style))
+                outs.add(json.dumps(filt, sort_keys=True))
+        self.assertEqual(len(outs), 1, 'the mask of client data must not depend on schema / --addFields')
 
     def test_path_precision_vendor_not_redacted_by_customer_path(self):
         for combo in ('schema', 'schema+addFields'):
-            out = self.run_tool(*self.flags_for(combo, '--pii')).stdout
+            out = self.run_tool(*self.flags_for(combo)).stdout
             self.assertIn(CAN_KEEP, out)
             # ... and in every context the vendor value stays (dotted key, $elemMatch, $set, $expr)
             self.assertGreaterEqual(out.count(CAN_KEEP), 6)
             self.assertIn(CAN_DEEP, out)         # contiguous path: customer.items.*.vipCode is a different path
 
     def test_path_is_contiguous_bare_name_matches_any_depth(self):
-        out = self.run_tool('--pii', '--loadSchemaFile', self.schema).stdout
+        out = self.run_tool('--loadSchemaFile', self.schema).stdout
         self.assertIn(CAN_DEEP, out)                              # customer.items.$[e].vipCode
         p = self.write_schema('bare_vip.json', {"fields": ["vipCode"]})
-        out2 = self.run_tool('--pii', '--loadSchemaFile', p).stdout
+        out2 = self.run_tool('--loadSchemaFile', p).stdout
         for c in (CAN_PATH, CAN_DEEP, CAN_KEEP):                  # any depth, any parent
             self.assertNotIn(c, out2)
 
     def test_path_in_aggregation_field_reference_and_free_text(self):
-        ent = L("COMMAND", "c1", 1, "Slow query", {
-            "type": "command", "ns": "shop.cust",
-            "errMsg": f"bad value customer.vipCode: {CAN_PATH} but vendor.vipCode: {CAN_KEEP}",
-            "command": {"aggregate": "cust", "cursor": {}, "$db": "shop", "pipeline": [
-                {"$match": {"$expr": {"$and": [{"$eq": ["$customer.vipCode", CAN_PATH]},
-                                               {"$in": [CAN_PATH + "-9", ["$customer.vipCode"]]},
-                                               {"$eq": ["$vendor.vipCode", CAN_KEEP]}]}}}]}})
+        ent = L("COMMAND", "c1", 1, "refs and text", {
+            "freeText": f"bad value customer.vipCode: {CAN_PATH} but vendor.vipCode: {CAN_KEEP}",
+            "check": [{"$eq": ["$customer.vipCode", CAN_PATH]},
+                      {"$in": [CAN_PATH + "-9", ["$customer.vipCode"]]},
+                      {"$eq": ["$vendor.vipCode", CAN_KEEP]}]})
         p = os.path.join(self.tmp.name, 'ref.log')
         with open(p, 'w') as fh:
             fh.write(json.dumps(ent) + '\n')
-        out = self.run_tool('--pii', '--loadSchemaFile', self.schema, log=p).stdout
+        out = self.run_tool('--loadSchemaFile', self.schema, log=p).stdout
         self.assertNotIn(CAN_PATH, out)
         self.assertNotIn(CAN_PATH + '-9', out)
-        self.assertIn(CAN_KEEP, out)
+        self.assertIn(CAN_KEEP, out)                      # vendor.vipCode is a different path
+
+    def test_flat_names_and_builtin_pii_in_comparisons_outside_client_data(self):
+        """{"$eq": ["$grId", <v>]} in a container that is not client data: the literal is a
+        value of the --addFields / schema field (or of a built-in PII key such as $email)."""
+        ent = L("COMMAND", "c1", 1, "refs", {"check": [
+            {"$eq": ["$grId", CAN_ADD]}, {"$in": [CAN_ADD + "-2", ["$grId"]]},
+            {"$eq": ["$email", CAN_DEFAULT]}, {"$eq": ["$other", CAN_KEEP]}]})
+        p = os.path.join(self.tmp.name, 'ref2.log')
+        with open(p, 'w') as fh:
+            fh.write(json.dumps(ent) + '\n')
+        none = self.run_tool(log=p).stdout
+        self.assertIn(CAN_ADD, none)                       # not requested -> default rules only
+        self.assertNotIn(CAN_DEFAULT, none)                # built-in PII key reference
+        added = self.run_tool('--addFields', 'grId', log=p).stdout
+        self.assertNotIn(CAN_ADD, added)
+        self.assertNotIn(CAN_ADD + '-2', added)
+        self.assertIn(CAN_KEEP, added)
 
     def test_flat_schema_field_matches_like_add_fields_everywhere(self):
-        out = self.run_tool('--pii', '--loadSchemaFile', self.schema).stdout
+        out = self.run_tool('--loadSchemaFile', self.schema).stdout
         self.assertNotIn(CAN_SCHEMA, out)         # $in operand, $set, $expr ref, CRUD.o, JSON string, free text
 
     def test_style_fruit_vs_x_for_schema_values(self):
-        fruit = json.loads(self.run_tool('--pii', '--loadSchemaFile', self.schema).stdout.splitlines()[0])
-        xpat = json.loads(self.run_tool('--pii', '--loadSchemaFile', self.schema,
+        fruit = json.loads(self.run_tool('--loadSchemaFile', self.schema).stdout.splitlines()[0])
+        xpat = json.loads(self.run_tool('--loadSchemaFile', self.schema,
                                         '--char_replacement').stdout.splitlines()[0])
         for key, path in (('tenantRef', ('attr', 'tenantRef')),
                           ('vipCode', ('attr', 'customer', 'vipCode')),
@@ -1079,26 +1147,28 @@ class SchemaFileTests(unittest.TestCase):
 
     def test_union_equals_add_fields_with_the_same_names(self):
         """schema fields + --addFields == one --addFields with both lists."""
-        a = self.run_tool('--pii', '--seed', 's', '--loadSchemaFile', self.schema,
+        a = self.run_tool('--seed', 's', '--loadSchemaFile', self.schema,
                           '--addFields', 'grId').stdout
         # the dotted path can only come from the file: compare on the flat names
         flat = os.path.join(self.tmp.name, 'flat.json')
         with open(flat, 'w') as fh:
             json.dump({"fields": ["tenantRef"]}, fh)
-        b = self.run_tool('--pii', '--seed', 's', '--loadSchemaFile', flat, '--addFields', 'grId').stdout
-        c = self.run_tool('--pii', '--seed', 's', '--addFields', 'grId,tenantRef').stdout
+        b = self.run_tool('--seed', 's', '--loadSchemaFile', flat, '--addFields', 'grId').stdout
+        c = self.run_tool('--seed', 's', '--addFields', 'grId,tenantRef').stdout
         self.assertEqual(b, c)
         self.assertNotEqual(a, c)                  # the path/nested part adds redactions
 
     def test_deterministic_with_seed(self):
-        f = self.flags_for('schema+addFields', '--pii', '--seed', 'abc')
+        f = self.flags_for('schema+addFields', '--seed', 'abc')
         self.assertEqual(self.run_tool(*f).stdout, self.run_tool(*f).stdout)
 
-    def test_works_with_server_redaction_and_redact_namespaces(self):
-        f = self.flags_for('schema+addFields', '--server_redaction', '--redactNamespaces')
+    def test_works_with_redact_namespaces_and_seed(self):
+        f = self.flags_for('schema+addFields', '--redactNamespaces', '--seed', 'k')
         out = self.run_tool(*f).stdout
         for c in self.ALL:
-            self.assertNotIn(c, out)
+            if c != CAN_DEEP:                  # contiguous path: customer.items.$[e].vipCode is another path
+                self.assertNotIn(c, out)
+        self.assertIn(CAN_DEEP, out)
 
     # ---- file formats ---------------------------------------------------------------------
     def write_schema(self, name, content):
@@ -1128,7 +1198,7 @@ class SchemaFileTests(unittest.TestCase):
         }
         for name, doc in variants.items():
             p = self.write_schema(name, doc)
-            out = self.run_tool('--pii', '--loadSchemaFile', p).stdout
+            out = self.run_tool('--loadSchemaFile', p).stdout
             for c in want[name]:
                 self.assertNotIn(c, out, (name, c))
             for c in {CAN_SCHEMA, CAN_PATH, CAN_NESTED, CAN_ADD} - want[name]:
@@ -1136,16 +1206,16 @@ class SchemaFileTests(unittest.TestCase):
 
     def test_case_insensitive_dollar_optional_and_dotted_match(self):
         p = self.write_schema('ci.json', {"fields": ["$TENANTREF", "GrId"], "paths": ["Customer.VIPCODE"]})
-        out = self.run_tool('--pii', '--loadSchemaFile', p).stdout
+        out = self.run_tool('--loadSchemaFile', p).stdout
         for c in (CAN_SCHEMA, CAN_ADD, CAN_PATH, CAN_PATH + '-2', CAN_PATH + '-3'):
             self.assertNotIn(c, out)
         self.assertIn(CAN_KEEP, out)
 
     def test_empty_schema_is_a_noop(self):
-        base = self.run_tool('--pii', '--seed', 's').stdout
+        base = self.run_tool('--seed', 's').stdout
         for doc in ({}, {"fields": []}, [], {"paths": []}):
             p = self.write_schema('empty.json', doc)
-            self.assertEqual(self.run_tool('--pii', '--seed', 's', '--loadSchemaFile', p).stdout, base)
+            self.assertEqual(self.run_tool('--seed', 's', '--loadSchemaFile', p).stdout, base)
 
     def test_legacy_text_log(self):
         tl = os.path.join(self.tmp.name, 'legacy.log')

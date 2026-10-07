@@ -1,6 +1,6 @@
 # ofuscator.py — Enhanced MongoDB Log and FTDC Obfuscation Tool
 
-An enhanced version of [fruitsalad](https://github.com/rueckstiess/fruitsalad) by Thomas Rueckstiess, with deep PII field-walking, namespace redaction, character-replacement mode, deterministic seeding, and FTDC diagnostic data redaction.
+An enhanced version of [fruitsalad](https://github.com/rueckstiess/fruitsalad) by Thomas Rueckstiess. **The default policy redacts client data the way the MongoDB server itself does with `security.redactClientLogData=true`** (every literal of every type inside commands, filters, documents and oplog entries becomes `###`, keys and structure are kept), and goes further: hosts, IPs, users, applications, namespaces, secrets and PII shapes are redacted in every string. Plus namespace redaction, an x-pattern mode, deterministic seeding, a custom-field schema file, and FTDC diagnostic data redaction.
 
 ---
 
@@ -38,78 +38,94 @@ pip install pymongo
 
 ## Mode 1 — Log redaction (`--log_redact`)
 
-Reads a MongoDB log file (JSON structured logs from MongoDB 4.4+, or legacy text logs) and outputs a fully redacted version safe to share with support teams.
+Reads a MongoDB log file (JSON structured logs from MongoDB 4.4+, or legacy text logs) and outputs a redacted version safe to share with support teams. A JSON log gives a JSON log (one valid logv2 object per line); a text log gives a text log.
 
 ```
 python3 ofuscator.py --log_redact <logfile> [options]
 ```
 
-**What is obfuscated:**
+### The default policy (no option needed)
 
-| Data type | Default behaviour | With flags |
-|-----------|-------------------|-----------|
-| IP addresses | Remapped to `192.168.x.x` | `xxx.xxx.xxx.xxx` with `--char_replacement` |
-| DB / collection names | Fruit/colour word substitution | Opaque `REDACTED_<hash>` with `--redactNamespaces` |
-| Query bodies (`filter`, `q`, `u`, `pipeline`) | MD5-hashed (entire blob) | Field-by-field walk with `--pii` |
-| PII values (emails, SSNs, credit cards, …) | Fruit/colour names | `x`-pattern with `--char_replacement` |
-| Custom application fields (`$comment`, `_tid`, …) | Not touched | Obfuscated when listed in `--addFields` |
-| Free-text error messages (`errMsg`) | Not touched | Namespace tokens replaced with `--redactNamespaces` |
+Running with no options already applies **all** of the following; there are no `--pii` / `--strict` / `--server_redaction` switches to remember.
+
+| What | Default behaviour |
+|------|-------------------|
+| **Client data**: `command` / `originatingCommand`, filters, updates, pipelines, documents, oplog entries (`o`, `o2`), `errInfo`, `keyValue`, shard-key bounds, resume tokens ... | Exactly the server's `redactClientLogData=true` output: **every scalar of every type** (strings, numbers, booleans, null, dates, ObjectIds, BinData) becomes the string `###`; field names, operators, nesting and arrays are kept. Collection names and `$db` inside a command are client data too. |
+| BinData subtype 6 (Encrypt) / 8 (Sensitive) anywhere | `###` (the server does this only from 6.0 on; 4.4 / 5.0 logs still carry the ciphertext) |
+| Status / exception text (`error`, `errMsg`, `reason`, `what()`) | `CodeName: ###`, `CodeName ###` or `###` (the code is kept, the reason dropped) |
+| Namespaces outside commands (`ns`, `namespace`, ...) | Fruit / colour words, or `REDACTED_<hash>` with `--redactNamespaces`; `config.*`, `local.*`, `admin.system.*`, `$cmd` kept |
+| Hosts, IPs (v4 / v6), `host:port`, FQDNs, users, `appName`, replica set / shard names, certificate subjects, file paths | Aliased (fruit / colour words, `x`-pattern with `--char_replacement`); learned and replaced in free text too |
+| Startup options, credentials, tokens, JWTs, cards, SSNs, emails, MACs, IBANs, URI passwords in **any** string | Redacted by key name and by content scan |
+| Extra fields you name (`--addFields`, `--loadSchemaFile`) | Redacted wherever they appear outside client data, in the chosen style |
+| Operational data: `t`, `s`, `c`, `id`, `ctx`, `msg`, counters, durations, plan summaries, locks | Kept, so the log stays analysable |
+
+Sample (input -> default output, `--seed s`):
+
+```json
+{"c":"COMMAND","msg":"Slow query","attr":{"ns":"shop.customers","appName":"AcmeBilling","command":{"find":"customers","filter":{"email":"alice.smith@acme-corp.com","age":{"$gt":18},"vip":true,"notes":"called twice"},"sort":{"createdAt":-1},"limit":5,"$db":"shop"},"planSummary":"IXSCAN { email: 1 }","nreturned":1,"durationMillis":7,"remote":"10.20.30.40:51234"}}
+```
+```json
+{"c":"COMMAND","msg":"Slow query","attr":{"ns":"darkcyan.damson","appName":"blueberry","command":{"find":"###","filter":{"email":"###","age":{"$gt":"###"},"vip":"###","notes":"###"},"sort":{"peach":"###"},"limit":"###","$db":"###"},"planSummary":"IXSCAN { raspberry: 1 }","nreturned":1,"durationMillis":7,"remote":"192.168.24.181:51234"}}
+```
+
+With `--char_replacement` the same line gives `"ns":"xxxx.xxxxxxxxx"`, `"appName":"xxxxxxxxxxx"`, `"remote":"xxx.xxx.xxx.xxx:51234"`; the `###` mask is the server's own token and is the same in both styles. A log that the server already redacted passes through unchanged (the policy is idempotent on `###`, `CodeName: ###`, `CodeName ###`).
+
+Because the policy mirrors the server, `limit`, `batchSize`, `writeConcern`, `ordered` ... inside a command are masked as well (the server masks them). Counters outside the command (`nreturned`, `keysExamined`, `durationMillis`, ...) stay.
 
 ### Log redaction options
 
 | Flag | Description |
 |------|-------------|
-| `--seed S` / `-s S` | Seed the random number generator with `S`. Same seed → same mapping every run. Useful for consistent obfuscation across multiple log files from the same cluster. |
-| `--pii` | Enable **deep PII obfuscation**. Instead of hashing the entire command blob, walks into `attr.command` values and obfuscates 50+ known PII fields individually, preserving the document structure so log analysis tools can still parse it. |
-| `--loadSchemaFile FILE` | JSON file with the extra fields you want obfuscated (bare names, dotted paths, or a nested schema). Rule: **default rules + the schema**, and together with `--addFields` the **union of all three**. Replacement style is the usual one (fruit words, or x-pattern with `--char_replacement`). See [Custom field schema](#custom-field-schema---loadschemafile). |
-| `--addFields FIELDS` | Comma-separated list of **extra field names** to obfuscate on top of the built-in PII list. Redacted in **every scope**: `attr.command`, oplog applier entries (`attr.CRUD.o`/`o2`), `originatingCommand`, error messages, JSON embedded in strings, operator values (`{"f": {"$in": [...]}}`), aggregation comparisons (`{"$eq": ["$f", "x"]}`), dotted/positional keys (`a.0.f`) and legacy text logs (`f: value`). Matching is case-insensitive and the leading `$` is optional. Example: `'$comment,_tid,appId'` |
-| `--strict` | Implies `--pii`. Redacts **every literal** inside filter / update / pipeline / document subtrees, not just values of known PII field names. Field names and `$operators` are preserved. Use this when unlisted application fields may hold personal data. |
-| `--server_redaction` (alias `--redactClientLogData`) | Implies `--pii`. Emulates the server's `security.redactClientLogData=true` on client-data attributes: BSON redaction level **all** (every scalar of any type becomes `"###"`, keys / structure / arrays kept, an EJSON wrapper such as `$oid`, `$date`, `$binary` counts as one scalar) and Status / exception text becomes `CodeName: ###` (`what()` -> `###`). The mask is always `###` (ignores `--char_replacement` for those values). Everything else (namespaces, hosts, users, apps, IPs, free text) is still redacted by the normal rules, because the server leaves those visible. See [Server-side redaction policy](#server-side-redaction-policy). |
+| `--seed S` / `-s S` | Fix the replacement key. The word (or `REDACTED_<hash>` token) for a value is derived from an HMAC of the value, so with the same seed **the same name maps to the same word in every file, in any order, with any other option**; without a seed a random key is used for each run. |
+| `--loadSchemaFile FILE` | JSON file with extra fields to obfuscate (bare names, dotted paths, or a nested schema). Rule: **default + schema**, and together with `--addFields` the **union of all three**. Style: fruit words, or x-pattern with `--char_replacement`. See [Custom field schema](#custom-field-schema---loadschemafile). |
+| `--addFields FIELDS` | Comma-separated **extra field names** to obfuscate on top of the default policy, at any depth and in any scope outside client data (generic attributes, JSON embedded in strings, aggregation comparisons such as `{"$eq": ["$f", "x"]}`, dotted / positional keys, free text, legacy text logs). Case-insensitive, leading `$` optional. Example: `'$comment,_tid,appId'` |
+| `--redactNamespaces` | Replace every database and collection name with a stable opaque token (`REDACTED_<8hex>`) in namespace attributes, free text and error strings. Well-known system namespaces (`local`, `admin`, `config`, `$cmd`) are preserved. |
+| `--char_replacement` | X-pattern instead of fruit / colour words for names, hosts, users, apps, schema fields ... Behaviour depends on whether `--char_fields` is also provided — see [below](#--char_replacement-behaviour). Client data stays `###`. |
+| `--char_fields FIELDS` | Comma-separated field names that receive x-pattern output when `--char_replacement` and `--seed` are both active. All other fields use fruit / colour words. Has no effect without `--char_replacement`. |
 | `--single_pass` | Skip the name-learning pre-pass (~2x faster). By default the file is read twice: pass 1 learns every db / collection / host / user / app name, pass 2 redacts, so a name is scrubbed from free text even if it is first revealed *after* the line that mentions it. |
-| `--redactNamespaces` | Replace every database name and collection name with a stable opaque token (`REDACTED_<8hex>`). Covers `attr.ns`, `attr.command.$db`, all collection-name command arguments (`find`, `update`, `insert`, `delete`, `aggregate`, `drop`, `dropIndexes`, `create`, `createIndexes`, `collection`, …), and free-text `errMsg` strings. Well-known system namespaces (`local`, `admin`, `config`, `$cmd`) are preserved. |
-| `--char_replacement` | X-pattern output mode. Behaviour depends on whether `--char_fields` is also provided — see [below](#--char_replacement-behaviour). |
-| `--char_fields FIELDS` | Comma-separated field names that receive x-pattern output when `--char_replacement` and `--seed` are both active. All other fields use fruit/colour obfuscation. Has no effect without `--char_replacement`. |
+
+**Deprecated, accepted and ignored:** `--pii`, `--strict`, `--server_redaction` and `--redactClientLogData` were options in earlier versions. They are the default policy now; passing them still works (hidden from `--help`) and prints one line to stderr: `note: ... ignored: deep PII, strict and server-style redaction are the default policy now.`
 
 ---
 
 ## How coverage works (universal sweep)
 
-Earlier versions redacted a fixed list of paths (`attr.command.filter`, `attr.ns`, ...). Every key of every entry is now visited at any depth, following the [logv2 schema](https://github.com/mongodb/mongo/blob/master/docs/logging.md) (`t`, `s`, `c`, `ctx`, `id`, `msg`, `attr`, `tags`, `truncated`, `size`, plus unknown extras):
+Every key of every entry is visited at any depth (there is no fixed list of paths), following the [logv2 schema](https://github.com/mongodb/mongo/blob/master/docs/logging.md) (`t`, `s`, `c`, `ctx`, `id`, `msg`, `attr`, `tags`, `truncated`, `size`, plus unknown extras):
 
 | Context | Treatment |
 |---------|-----------|
-| `command` / `commandSpec` / `originatingCommand` | Default-deny: only known structural keys (`limit`, `batchSize`, `ordered`, `writeConcern`, ...) are kept; every other key (`documents`, `updates`, `deletes`, `pipeline`, `comment`, unknown future keys) is data |
-| Payload documents (`documents`, `o`, `o2`, `errInfo`, `keyValue`, `min`/`max`, `resumeToken`, `firstBatch`, ...) | With `--pii` every leaf is redacted, keys preserved |
-| Filters / updates / pipelines | PII field names (case- and separator-insensitive, dotted paths); operator operands (`$in`, `$eq`, `$regex`, `$gt`, ...) are walked, not skipped; `$expr` comparisons against a PII field reference are redacted |
+| `command` / `commandSpec` / `originatingCommand` / `request` / `cmdObj` | The whole BSON, like the server: every scalar `###` (collection name, `$db`, `limit`, `lsid`, `$clusterTime` ... included); keys kept, except the keys of `sort` / `hint` / `projection` / `fields` (index and field names), which are obfuscated |
+| Payload documents (`documents`, `o`, `o2`, `errInfo`, `keyValue`, `min`/`max`, `splitPoint`, `resumeToken`, `firstBatch`, ...) | Every leaf `###`, keys preserved |
+| Filters / updates / pipelines (`filter`, `q`, `u`, `updates`, `pipeline`, `$expr`, ...) | Every literal `###`; operators (`$in`, `$eq`, `$regex`, `$gt`, ...) and field names kept; a `{$regex, $options}` document is masked field by field |
 | Namespaces (`ns`, `namespace`, `$db`, `db`, `$lookup.from`, `$out`, ...) | db/collection aliasing (or `REDACTED_<hash>`); `config.*`, `local.*`, `admin.system.*` kept |
 | Hosts / IPs (`host`, `remote`, `client`, `syncSource`, connection strings, `members[].host`, topology descriptions) | Hostnames, IPv4, IPv6, `host:port` |
 | Users / apps / replica-set & shard names / certificate subjects | Aliased; learned and replaced in later free text |
 | Startup options, `config`, `security`, `ldap`, `net`, `setParameter` | All string leaves redacted |
-| Error / status text (`error`, `errmsg`, `errMsg`, `reason`, topology descriptions) | Quoted literals, `{ field: value }` documents (dup-key values) and `db.coll` names masked |
+| Error / status text (`error`, `errmsg`, `errMsg`, `reason`, `what`) | `CodeName: ###` / `###` (server form). Other descriptive text (topology descriptions, `message`): quoted literals, `{ field: value }` documents and `db.coll` names masked |
 | **Every string, everywhere** (incl. `msg`, `ctx`, keys) | Content scan: emails, credit cards (Luhn), SSNs, IBANs, phones, JWTs, bearer/basic tokens, AWS keys, MACs, IPv4/IPv6, FQDNs, URI credentials, filesystem paths, JSON serialised inside strings |
 
 **Both replacement styles use exactly the same rules.** Detection is independent of style; only `_replacement()` decides between fruit/colour words and x-pattern. `test_ofuscator.py` enforces this: it runs both styles and asserts that a token is changed in one style if and only if it is changed in the other.
 
 **Robustness (fail closed).** Blank first lines, syslog-prefixed JSON, truncated/garbled lines and non-object JSON are redacted with the text pipeline instead of aborting; raw input is never written to stderr. Output lines always equal input lines.
 
-**Hashes are salted.** Blob hashes, numeric replacements and `REDACTED_<hash>` tokens use HMAC-SHA256 keyed with `--seed` (or a random per-run key when no seed is given). Earlier versions used unsalted MD5, which can be brute-forced for low-entropy values (SSNs, phone numbers, common collection names). Consequence: tokens are stable across files only when the **same `--seed`** is used.
+**Hashes and words are keyed.** Numeric replacements, `REDACTED_<hash>` tokens and the choice of fruit / colour words use HMAC-SHA256 keyed with `--seed` (or a random per-run key when no seed is given); unsalted MD5, which can be brute-forced for low-entropy values, is not used. Consequence: tokens and words are stable across files only when the **same `--seed`** is used.
 
 ---
 
 ## Custom field schema (`--loadSchemaFile`)
 
-`--loadSchemaFile FILE` lets you keep the list of application-specific fields to obfuscate in a JSON file instead of
-on the command line. The rule for combining options is a plain **union on top of the built-in rules**:
+`--loadSchemaFile FILE` keeps the list of application-specific fields to obfuscate in a JSON file instead of on the command line. The rule for combining options is a plain **union on top of the default policy**:
 
 | Options | What is redacted |
 |---------|------------------|
-| none | the **default** rules only |
+| none | the **default** policy |
 | `--loadSchemaFile f.json` | default + the schema in `f.json` |
 | `--addFields a,b` | default + the fields `a`, `b` |
 | `--loadSchemaFile f.json --addFields a,b` | default + the schema + the fields |
 
-The replacement style does not depend on the schema: fruit / colour words by default, x-pattern with `--char_replacement`
-(and `--char_fields`, `--seed`, `--redactNamespaces`, `--strict`, `--server_redaction` combine as usual).
+The replacement style does not depend on the schema: fruit / colour words by default, x-pattern with `--char_replacement` (`--char_fields`, `--seed`, `--redactNamespaces` combine as usual).
+
+**Where it matters.** Inside client data (commands, filters, updates, documents, oplog entries) the default policy already masks *every* literal with `###`, so a field named in the schema is masked there with or without it. The schema extends the reach to everything else: generic attributes, containers the server does not treat as client data, JSON serialised in strings, free text, comparisons against field references, legacy text logs, and it makes those values appear in the style you chose (fruit words or x-pattern) instead of staying readable.
 
 **File format** (every key optional; a top-level JSON array is shorthand for `"fields"`):
 
@@ -123,72 +139,68 @@ The replacement style does not depend on the schema: fruit / colour words by def
 
 | Key | Meaning |
 |-----|---------|
-| `fields` | bare field names, matched at **any depth and in any scope** exactly like `--addFields`: filters, updates, documents, oplog `o`/`o2`, `originatingCommand`, error text, JSON serialised in strings, aggregation comparisons (`{"$eq": ["$tenantRef", "x"]}`), legacy text logs. Case-insensitive, leading `$` optional, dotted / positional keys (`a.0.tenantRef`, `a.$[e].tenantRef`) handled. |
+| `fields` | bare field names, matched at **any depth** exactly like `--addFields`: nested objects, operator operands (`{"f": {"$in": [..]}}`), JSON serialised in strings, aggregation comparisons (`{"$eq": ["$tenantRef", "x"]}` and `{"$in": ["x", ["$tenantRef"]]}`), free text (`tenantRef: x`), legacy text logs. Case-insensitive, leading `$` optional, dotted / positional keys (`a.0.tenantRef`, `a.$[e].tenantRef`) handled. |
 | `paths` | dotted paths. The value of a key is redacted when its ancestor chain **ends with** the path: `customer.vipCode` matches `{"customer": {"vipCode": ..}}`, `{"customer.vipCode": ..}` (dot notation), `{"customer": {"$elemMatch": {"vipCode": ..}}}`, `customer: [{vipCode: ..}]`, `$set: {"customer.vipCode": ..}`, `{"$eq": ["$customer.vipCode", <value>]}` and free text `customer.vipCode: <value>`, but **not** `vendor.vipCode`. `$operators`, array indexes and positional `$[x]` are transparent. The path is contiguous: `customer.items.$[e].vipCode` is a different path. |
 | `schema` | nested object; every leaf whose value is `true` (or `{}` / `null`) becomes a path (`false` is ignored). A file with no known key is read as this nested form. |
 | `version`, `description`, `comment` | ignored |
 
-Use a bare name in `fields` when the field may appear under any parent; use `paths` / `schema` when the same field name
-must be redacted under one parent only.
+Use a bare name in `fields` when the field may appear under any parent; use `paths` / `schema` when the same field name must be redacted under one parent only.
 
-Example (`--pii --seed s`, same input line, fields `tenantRef`, `customer.vipCode`, `loyalty.tier` in the file and `--addFields grId`):
+Example (`--seed s`; schema = `fields: [tenantRef]`, `paths: [customer.vipCode]`; one line whose attributes are not client data):
 
-| Options | `filter` of the slow query |
-|---------|----------------------------|
-| none | `{"email": "ugli.fruit@aliceblue.com", "grId": "G-1001", "tenantRef": "T-77", "customer.vipCode": "VIP-9", "vendor.vipCode": "V-5", "loyalty": {"tier": "gold"}}` |
-| `--loadSchemaFile` | `{"email": "coconut@palegreen.com", "grId": "G-1001", "tenantRef": "melon", "customer.vipCode": "apple", "vendor.vipCode": "V-5", "loyalty": {"tier": "ugli.fruit"}}` |
-| `--addFields grId` | `{"email": "ugli.fruit@aliceblue.com", "grId": "coconut", "tenantRef": "T-77", ...}` |
-| both | `{"email": "coconut@palegreen.com", "grId": "melon", "tenantRef": "physalis", "customer.vipCode": "apple", "vendor.vipCode": "V-5", "loyalty": {"tier": "ugli.fruit"}}` |
-| both + `--char_replacement` | `{"email": "xxxxx@xxxx.xxx", "grId": "x-xxxx", "tenantRef": "x-xx", "customer.vipCode": "xxx-x", "vendor.vipCode": "V-5", "loyalty": {"tier": "xxxx"}}` |
+| Options | `attr` |
+|---------|--------|
+| none | `{"emails":["damson","date"],"tenantRef":"T-77","customer":{"vipCode":"VIP-9"},"vendor":{"vipCode":"V-5"}}` |
+| `--loadSchemaFile` | `{"emails":["damson","date"],"tenantRef":"olive","customer":{"vipCode":"tamarillo"},"vendor":{"vipCode":"V-5"}}` |
+| `--loadSchemaFile --char_replacement` | `{"emails":["xxxxx@xxxxxxxxxxxx.xxx","xxxxx@xxxxxxxxxxxx.xxx"],"tenantRef":"x-xx","customer":{"vipCode":"xxx-x"},"vendor":{"vipCode":"V-5"}}` |
 
-A missing file, invalid JSON or a wrong type (`"fields": "grId"`, `"paths": [5]`, `"schema": {"a": 5}` ...) stops the run with a one-line
-`error: --loadSchemaFile: ...` and exit code 2 (no traceback, the file content is never echoed). The option is rejected with `--ftdc_redact`.
-Empty schemas (`{}`, `[]`, `{"fields": []}`) are accepted and change nothing.
+(`emails` is a built-in PII key, so it is redacted by the default policy in every row; `vendor.vipCode` matches nothing and stays.)
+
+A missing file, invalid JSON or a wrong type (`"fields": "grId"`, `"paths": [5]`, `"schema": {"a": 5}` ...) stops the run with a one-line `error: --loadSchemaFile: ...` and exit code 2 (no traceback, the file content is never echoed). The option is rejected with `--ftdc_redact`. Empty schemas (`{}`, `[]`, `{"fields": []}`) are accepted and change nothing.
+
+---
 
 ## Server-side redaction policy
 
-The policies of the MongoDB server's own log redaction (`logv2/redaction.cpp`, `logv2/log_util.cpp`,
-enterprise `log_redact_options.cpp`, `repl/bgsync.cpp`, and the nested `BSONObj::redact`) were compared with
-this tool; the gaps are closed as follows (measured against real servers in [TEST_RESULTS.md](./TEST_RESULTS.md#3b-server-side-redaction-policy-what-the-mongodb-server-itself-does)):
+The policies of the MongoDB server's own log redaction (`logv2/redaction.cpp`, `logv2/log_util.cpp`, enterprise `log_redact_options.cpp`, `repl/bgsync.cpp`, and the nested `BSONObj::redact`) were compared with this tool and are all part of the **default policy** (measured against real servers in [TEST_RESULTS.md](./TEST_RESULTS.md#3b-server-side-redaction-policy-what-the-mongodb-server-itself-does)):
 
-| Server policy | In this tool |
-|---------------|--------------|
-| BinData subtype **6 (Encrypt)** and **8 (Sensitive)** become `"###"` at any depth, even with `redactClientLogData` off (`redactEncryptedFields` defaults to true; subtype 8 always) | **Always on** in every mode and every context (filters, documents, generic attrs, JSON embedded in strings, legacy `$binary/$type` form). Needed because 4.4 and 5.0 servers still write the base64 of those payloads. Subtypes 0 / 4 are untouched. |
-| `redactClientLogData=true`: every scalar of any type -> `"###"` | `--server_redaction`. Independently of that flag, `--pii` now also erases booleans, null and `0/1/-1` in **payload documents** (`insert.documents`, oplog `o`/`o2`, `errInfo`, shard-key bounds ...) and booleans under PII keys (`hivStatus: true`). |
-| `redact(Status)` -> `CodeName: ###`, `redact(DBException)` -> `CodeName ###`, `redact(what())` -> `###` | `--server_redaction` |
-| Logs already redacted by the server must survive a second pass | Idempotent on `###`, `CodeName: ###`, `CodeName ###`, `OK` in every mode |
+| Server policy | In this tool (default) |
+|---------------|------------------------|
+| BinData subtype **6 (Encrypt)** and **8 (Sensitive)** become `"###"` at any depth, even with `redactClientLogData` off (`redactEncryptedFields` defaults to true; subtype 8 always) | Always masked, in every context, both EJSON forms. Needed because 4.4 and 5.0 servers still write the base64 of those payloads. Subtypes 0 / 4 are untouched. |
+| `redactClientLogData=true`: BSON level `all`, every scalar of any type -> `"###"`, keys / structure / arrays kept, an EJSON wrapper (`$oid`, `$date`, `$binary` ...) counts as one scalar | Applied to all client data (commands, filters, documents, oplog entries, `errInfo`, ...). A `{$regex, $options}` document is masked field by field, as the server does. |
+| `redact(Status)` -> `CodeName: ###`, `redact(DBException)` -> `CodeName ###`, `redact(what())` -> `###` | Same forms (`Code{ extra }: reason` is reduced to `Code: ###`); structured `{code, codeName, errmsg}` keeps the codes and masks `errmsg` |
+| Logs already redacted by the server must survive a second pass | Idempotent on `###`, `CodeName: ###`, `CodeName ###`, `OK` |
 
-Deliberate deviations from the server: the keys of `sort` / `hint` / `projection` / `fields` (index and field
-names, which the server leaves visible) are always obfuscated, and booleans / `-1,0,1` stay as-is under
-`$project`, `$sort`, `$group` and update options (`multi`, `upsert` ...) in non-payload queries, because masking
-them changes what the query means. The server itself redacts only the call sites wrapped in `redact()`: with
-`redactClientLogData=true` it still prints `not authorized on acmeshopdb to execute command {...}`, host names
-and several `error` reasons; this tool masks those as well.
+Deliberate deviation from the server: the keys of `sort` / `hint` / `projection` / `fields` (index and field names, which the server leaves visible) are obfuscated.
+
+This tool is **stricter** than the server where the server is not exhaustive: it redacts only the call sites wrapped in `redact()`, so even with `redactClientLogData=true` it still prints `not authorized on acmeshopdb to execute command {...}`, host names, namespaces, `appName`, users and several `error` reasons. The default policy masks all of those too; verified against enterprise 5.0 / 7.0 / 8.0 servers that redact their own logs.
+
+---
 
 ## `--redactNamespaces`
 
 Replaces every database and collection name segment with a **stable, hash-based opaque token** — the same name always maps to the same token within a run.
 
 ```bash
-python3 ofuscator.py --log_redact mongod.log --pii --redactNamespaces > redacted.log
+python3 ofuscator.py --log_redact mongod.log --redactNamespaces > redacted.log
 ```
 
 **Input log fields:**
 ```
 attr.ns                   → "pii_test_db.$cmd"
-attr.command.$db          → "pii_test_db"
-attr.command.find         → "sensitive_records"
-attr.command.drop         → "sensitive_records"
-attr.errMsg               → "ns not found pii_test_db.sensitive_records"
+attr.namespace            → "pii_test_db.sensitive_records"
+attr.command.$db          → "pii_test_db"        (client data: "###" in the default policy)
+attr.command.find         → "sensitive_records"  (client data: "###" in the default policy)
+attr.note                 → "ns not found pii_test_db.sensitive_records"
 ```
 
 **Output:**
 ```
 attr.ns                   → "REDACTED_edaac6f4.$cmd"
-attr.command.$db          → "REDACTED_edaac6f4"
-attr.command.find         → "REDACTED_20170fcb"
-attr.command.drop         → "REDACTED_20170fcb"
-attr.errMsg               → "ns not found REDACTED_edaac6f4.REDACTED_20170fcb"
+attr.namespace            → "REDACTED_edaac6f4.REDACTED_20170fcb"
+attr.command.$db          → "###"
+attr.command.find         → "###"
+attr.note                 → "ns not found REDACTED_edaac6f4.REDACTED_20170fcb"
 ```
 
 The token format `REDACTED_<8hex>` is a salted HMAC. With the same `--seed` the same name always produces the same token, so entries can be correlated across multiple redacted files; without `--seed` a random key is used per run.
@@ -202,10 +214,10 @@ This flag has two distinct modes depending on how it is combined with other opti
 ### Used alone — replaces everything with x-pattern
 
 ```bash
-python3 ofuscator.py --log_redact mongod.log --pii --char_replacement > redacted.log
+python3 ofuscator.py --log_redact mongod.log --char_replacement > redacted.log
 ```
 
-All obfuscated values become x-pattern placeholders. No fruit/colour names are used. Makes it immediately obvious the log was processed — reviewers can search for real patterns (e.g. `@`) and confirm nothing slipped through.
+All obfuscated names, hosts, users, apps and schema fields become x-pattern placeholders; no fruit / colour names are used. (Client data is `###` in both styles.) Makes it immediately obvious the log was processed — reviewers can search for real patterns (e.g. `@`) and confirm nothing slipped through.
 
 **Input:**
 ```json
@@ -220,7 +232,7 @@ All obfuscated values become x-pattern placeholders. No fruit/colour names are u
 
 ```bash
 python3 ofuscator.py --log_redact mongod.log \
-  --pii --seed myseed \
+  --seed myseed \
   --char_replacement --char_fields 'emails,externalShares,$comment' \
   > redacted.log
 ```
@@ -240,27 +252,27 @@ The **main obfuscation uses fruit/colour names** (seeded, consistent). Only the 
 
 ## Log redaction examples
 
-### Basic obfuscation (namespaces + IPs only)
+### Default run (nothing to choose)
 
 ```bash
 python3 ofuscator.py --log_redact mongod.log > redacted.log
 ```
 
-Namespace segments replaced with fruit/colour words, IPs remapped to `192.168.x.x`. Query bodies are MD5-hashed as a single blob.
+Client data (commands, filters, documents, oplog entries) is masked exactly like the server's `redactClientLogData=true` (`###`, keys and structure kept), Status text becomes `CodeName: ###`, BinData 6/8 is masked, and namespaces, hosts, IPs, users, apps, secrets and PII shapes are replaced by fruit / colour words.
 
-### Deep PII obfuscation with a deterministic seed
+### Deterministic output across all files of a cluster
 
 ```bash
-python3 ofuscator.py --log_redact mongod.log --pii --seed mysecretkey > redacted.log
+python3 ofuscator.py --log_redact mongos.log --seed mysecretkey > mongos.red.log
+python3 ofuscator.py --log_redact shard1.log --seed mysecretkey > shard1.red.log
 ```
 
-Walks into command bodies field by field. Same seed on the same log always produces the same output — useful for correlating multiple log files from the same cluster.
+With the same seed the same name maps to the same word in every file (and with any other option), so the redacted files of one cluster can still be correlated.
 
 ### Full redaction recommended for external sharing
 
 ```bash
 python3 ofuscator.py --log_redact mongod.log \
-  --pii \
   --addFields '$comment,_tid,recordId,tenant' \
   --seed mysecretkey \
   --char_replacement \
@@ -268,31 +280,31 @@ python3 ofuscator.py --log_redact mongod.log \
   > redacted.log
 ```
 
-This combination achieves **100% PII removal** (verified against 17 sensitive data categories in an independent benchmark against MongoDB 5.0.31):
-
-- `--pii` — deep field walk, 50+ built-in PII field names
-- `--addFields` — extends to app-specific fields (`$comment`, `_tid`, tenant IDs)
+- (default) — server-style redaction of every client literal, BinData 6/8, Status forms, hosts / IPs / users / apps / secrets
+- `--addFields` — extends to app-specific fields outside client data (`$comment`, `_tid`, tenant IDs)
 - `--seed` — deterministic, consistent output across shards
-- `--char_replacement` — all values become x-pattern for unambiguous visual review
+- `--char_replacement` — names, hosts, users and the extra fields become x-pattern for unambiguous visual review
 - `--redactNamespaces` — db/collection names and free-text error strings redacted to `REDACTED_<hash>`
 
-### Obfuscate PII and specific extra fields only
+### Extra fields from a schema file
 
 ```bash
-python3 ofuscator.py --log_redact mongod.log --pii --addFields '$comment,_tid' --seed test123 > redacted.log
+python3 ofuscator.py --log_redact mongod.log --loadSchemaFile fields.json --addFields '$comment' > redacted.log
 ```
 
-### Full x-pattern (no seed, blanket replacement)
+Default + the schema in `fields.json` + `$comment` (see [Custom field schema](#custom-field-schema---loadschemafile)).
+
+### Full x-pattern (no seed)
 
 ```bash
-python3 ofuscator.py --log_redact mongod.log --pii --addFields '$comment,_tid' --char_replacement > redacted.log
+python3 ofuscator.py --log_redact mongod.log --addFields '$comment,_tid' --char_replacement > redacted.log
 ```
 
 ### Selective x-pattern — specific fields blanked, rest fruit/colour
 
 ```bash
 python3 ofuscator.py --log_redact mongod.log \
-  --pii --seed test123 \
+  --seed test123 \
   --char_replacement --char_fields 'emails,externalShares,$comment,_tid' \
   > redacted.log
 ```
@@ -362,9 +374,9 @@ python3 ofuscator.py --ftdc_redact \
 
 ---
 
-## Built-in PII field list (`--pii`)
+## Built-in PII field list
 
-The following field names are treated as PII and obfuscated recursively anywhere inside `attr.command`. Both exact keys and the last segment of dot-notation filter keys (e.g. `"identity.ssn"`) are matched.
+The following field names are recognised as PII wherever they appear: in client data every literal is already `###`, and outside client data (generic attributes, JSON in strings, comparisons against field references such as `{"$eq": ["$email", "x"]}`, free text) their values are replaced in the chosen style. Both exact keys and the last segment of dot-notation keys (e.g. `"identity.ssn"`) are matched, case- and separator-insensitively.
 
 **Identity**
 ```
@@ -456,13 +468,12 @@ Each character class is replaced individually, preserving structural separators 
 
 ## Seed and determinism
 
-`--seed` controls the random word mappings for fruit/colour substitution:
+`--seed` keys the replacements. The fruit / colour word (and the `REDACTED_<hash>` token) for a value is an HMAC of the value under that key, not a draw from a shared random stream:
 
-- Same seed + same input → same output, every run
-- Useful when obfuscating multiple log files from different shards of the same cluster — the same namespace or field value maps to the same replacement across all files
-- Different seeds produce different word mappings; the mapping cannot be reversed without the seed
-
-`--redactNamespaces` tokens (`REDACTED_<hash>`) are HMAC-SHA256 keyed with the seed; use the same `--seed` on every file of a cluster to keep them correlatable.
+- Same seed + same input -> same output, every run
+- The same name maps to the same word in **every file** of a cluster, in any order, with any combination of the other options (tested: `test_seed_gives_the_same_words_across_files_order_and_options`)
+- A different seed gives different words; the mapping cannot be reversed without the seed
+- Without `--seed` a random key is generated for each run
 
 ---
 
@@ -472,7 +483,7 @@ Each character class is replaced individually, preserving structural separators 
 python3 test_ofuscator.py -v
 ```
 
-`test_ofuscator.py` (63 tests) builds ~30 entries modelled on the mongod/mongos log schema (slow queries for find/insert/update/delete/findAndModify/aggregate/getMore, auth, TLS, client metadata, replication, sharding `moveChunk`, index builds, oplog applier, startup options, change streams, truncated entries, legacy text) carrying canary PII. For the whole flag matrix (default, `--pii`, `--strict`, `--redactNamespaces`, `--char_replacement`, `--char_fields`, `--seed`, `--addFields`) it asserts that **no canary appears anywhere in stdout or stderr**, that output stays valid JSON with the same line count, that fruit and x-pattern styles have identical coverage, and that no unsalted MD5 of a sensitive value is emitted.
+`test_ofuscator.py` (62 tests) builds ~30 entries modelled on the mongod/mongos log schema (slow queries for find/insert/update/delete/findAndModify/aggregate/getMore, auth, TLS, client metadata, replication, sharding `moveChunk`, index builds, oplog applier, startup options, change streams, truncated entries, legacy text) carrying canary PII. For the option matrix (default, `--redactNamespaces`, `--char_replacement`, `--char_fields`, `--seed`, `--single_pass`, `--addFields`, `--loadSchemaFile`) it asserts that **no canary appears anywhere in stdout or stderr**, that output stays valid JSON with the same line count, that fruit and x-pattern styles have identical coverage, and that no unsalted MD5 of a sensitive value is emitted.
 
 ### Integration test against real mongod / mongos logs
 
@@ -490,24 +501,28 @@ OFUSCATOR_MONGO_VERSION=5.0 python3 -m unittest test_integration_mongo
 
 - `X.Y` resolves to the newest `X.Y.Z` that `m` can actually install here (e.g. `5.0` -> 5.0.31: 5.0.32-5.0.34 have no macOS binaries). Your **active `m` version is restored** afterwards (symlinks are snapshotted and re-created); versions it had to download stay installed (`m rm <ver>` to remove).
 - The workload covers CRUD, aggregation (`$lookup`/`$out`/`$unionWith`), dup-key / validation / bad-modifier errors, transactions, change streams + resume tokens, index builds, sharding (`shardCollection`, `split`, `moveChunk`), users, failed and successful logins, several `appName`s, and direct shard connections.
-- Checks (per log x flag matrix): no canary PII in stdout/stderr, no source IP survives, machine hostname / OS user / work dir are removed, every line is schema-valid logv2 JSON with unchanged `t/s/c/id` and top-level `attr` keys, the message histogram and operational counters are preserved, fruit and x-pattern styles have identical coverage, independent PII-shape scans of the output, determinism / salting, idempotence, and fail-closed behaviour on a damaged copy of the real log.
+- Checks (per log x flag matrix): no canary PII in stdout/stderr, no source IP survives, machine hostname / OS user / work dir are removed, every line is schema-valid logv2 JSON with unchanged `t/s/c/id` and top-level `attr` keys, the message histogram and operational counters are preserved, system namespaces and loopback addresses are kept, fruit and x-pattern styles have identical coverage, independent PII-shape scans of the output, determinism / salting, idempotence, and fail-closed behaviour on a damaged copy of the real log.
 - It also verifies the test is not vacuous: the canaries must really appear in the source logs produced by that server version.
 - mtools 1.7.2 cannot parse 4.4+ JSON logs (it returns no datetime even for the original log), so for those versions the built-in logv2 validator is used; on legacy text logs `mloginfo` is used as the independent parse check.
-- `--loadSchemaFile` x `--addFields`: 20 unit tests cover the 4 option combinations x fruit / x style x `--pii` / `--strict` / default mode on nine contexts (generic attr, filter with dotted keys, `$elemMatch`, arrays, `$set` on dotted and positional paths, `$expr` field references, oplog `o`, JSON in a string, free text), path precision (`vendor.vipCode` stays), file formats, validation errors and legacy text logs; the real-cluster suite repeats the four combinations against the mongos / shard / config logs (`test_56`, `test_57`).
-- `--ground-truth` (enterprise build, e.g. `5.0.31-ent`, `7.0.17-ent`, `8.0.17-ent`) also runs a **second cluster whose server redacts its own logs** (`redactClientLogData=true`) and asserts that every distinct redacted command of the user operations is identical to `--server_redaction` applied to the unredacted cluster, that Status forms agree wherever the server masks, and that the tool is idempotent on the server-redacted logs.
+- `--loadSchemaFile` x `--addFields`: 20 unit tests cover the 4 option combinations x fruit / x style on nine contexts outside client data (generic attr, query-shaped containers with dotted keys, `$elemMatch`, arrays, `$set` on dotted and positional paths, comparisons against field references, sub-documents, JSON in a string, free text), path precision (`vendor.vipCode` stays), file formats, validation errors and legacy text logs, and prove that client data is masked identically under every combination. The real-cluster suite repeats the four combinations on a real mongos log with an injected probe entry (`test_56`, `test_57`).
+- `--ground-truth` (enterprise build, e.g. `5.0.31-ent`, `7.0.17-ent`, `8.0.17-ent`) also runs a **second cluster whose server redacts its own logs** (`redactClientLogData=true`) and asserts that every distinct redacted command of the user operations is identical to the **default output** for the unredacted cluster, that Status forms agree wherever the server masks, and that the tool is idempotent on the server-redacted logs.
 - Run against 4.4, 5.0, 6.0, 7.0 and 8.0 while developing; it found real gaps the synthetic fixtures missed (shard-key `splitPoint`, internal `config.cache.chunks.<ns>` namespaces, index names in specs, `dropIndexes.index`, short host names in `event`/`server`, field-name collisions dropping fields).
 
 ## Known limits
 
-- Without `--strict`, values of application field names that are neither in the built-in list nor in `--addFields` and that do not look like a known PII shape (e.g. `{"nickname2": "free text"}` inside a *filter*) are kept. Payload documents (`insert.documents`, oplog `o`/`o2`, ...) are always fully redacted with `--pii`; use `--strict` for filters/updates/pipelines.
-- Bare numbers (e.g. a 9-digit SSN stored as a string) are only detected by key name or by an `$expr` comparison with a PII field, not by shape.
+- The default policy mirrors the server, so inside a command **everything** is masked, including `limit`, `batchSize`, `maxTimeMS`, `writeConcern`, `ordered`, the collection name and `$db`. Analysis of query shapes therefore relies on the plan summary, counters and durations outside the command, and on field names and operators, which are kept.
+- Outside client data, a value is redacted when its key is a built-in PII name, an `--addFields` / schema field, or when its content looks like PII (email, card, SSN, IP, host, token, path ...). A value that is neither (for example `{"nickname2": "free text"}` in a custom attribute `attr.myStuff`) stays: name the field with `--addFields` / `--loadSchemaFile`.
+- Bare numbers (e.g. a 9-digit SSN stored as a string) outside client data are only detected by key name or by a comparison with a PII field reference, not by shape.
 - Names are replaced in free text only when learned from a keyed field (`--single_pass` makes this order-dependent).
 - `--ftdc_redact` only rewrites `hostInfo` in type-0 chunks. The compressed reference document of type-1 chunks (`replSetGetStatus` member hostnames, `serverStatus.host`, ...) is passed through unchanged.
+- Schema `paths` are contiguous suffixes (`customer.vipCode` does not match `customer.items.$[e].vipCode`); use a bare name in `fields` for any depth.
 - Always review the output manually before sharing externally.
 
 ---
 
 ## Benchmark results
+
+> Historical: measured with an earlier version, run as `--pii --addFields '$comment,_tid,recordId,tenant' --seed ... --char_replacement --redactNamespaces`. Those behaviours are the default policy now (and stricter), so the same result is obtained without `--pii`.
 
 Tested against a live MongoDB 5.0.31 instance (`m 5.0.31`, `slowMs = 0`) with a workload generating real PII across 17 sensitive data categories (emails, SSNs, credit cards, passports, IPs, HIV status, password hashes, API keys, bearer tokens, IBAN, crypto wallets, `$comment` tags, db/collection names, and more).
 

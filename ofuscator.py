@@ -10,11 +10,18 @@ Two main operating modes, selected by a required top-level flag:
         Obfuscate a MongoDB log file (JSON structured or legacy text format).
         All options below apply only to this mode.
 
+        The DEFAULT policy (no option needed) redacts client data the way the MongoDB
+        server does with security.redactClientLogData=true: every literal of every
+        type inside commands, filters, documents and oplog entries becomes "###"
+        (keys and structure kept), BinData Encrypt/Sensitive is masked, Status text
+        becomes "CodeName: ###"; plus hosts, IPs, users, apps, namespaces, secrets
+        and PII shapes in every string.  (--pii, --strict and --server_redaction
+        are accepted for backward compatibility and ignored: they are the default.)
+
         --seed S / -s S          Seed the random number generator with S.
-        --pii                    Deep PII obfuscation (field-by-field walk).
-        --strict                 Implies --pii; redact every literal in data subtrees.
         --single_pass            Skip the name-learning pre-pass (faster).
-        --addFields FIELDS       Extra command-level fields to obfuscate.
+        --loadSchemaFile FILE    JSON schema of extra fields to obfuscate.
+        --addFields FIELDS       Extra field names to obfuscate.
         --redactNamespaces       Replace db/collection names with REDACTED_<hash>.
         --char_replacement       Use x-pattern instead of fruit/colour names.
         --char_fields FIELDS     Fields that get x-pattern in selective mode.
@@ -41,7 +48,6 @@ Two main operating modes, selected by a required top-level flag:
 """
 
 from enum import Enum
-from random import seed as rseed, randrange, choice
 from functools import reduce
 import argparse
 import re
@@ -175,7 +181,7 @@ class LogType(Enum):
 
 
 # Fields inside attr.command (and nested structures) that are considered PII
-# when --pii is active.  These are matched against both exact keys and the
+# (the default policy).  These are matched against both exact keys and the
 # last segment of dotted-path keys (e.g. "identity.ssn" → "ssn").
 _PII_VALUE_KEYS = {
     # Identity
@@ -272,7 +278,7 @@ def _nset(*names):
 #  S2  redactClientLogData=true: every scalar of ANY type (string, number, bool,
 #      null, date, oid, bindata ...) -> the string "###"; keys / structure kept,
 #      arrays walked.                                   [--server_redaction here;
-#      payload documents get the same type-erasure in --pii]
+#      payload documents get the same type-erasure]
 #  S3  redact(Status) -> "CodeName: ###" (OK stays OK), redact(DBException) ->
 #      "CodeName ###", redact(e.what()) -> "###".       [--server_redaction here]
 # ══════════════════════════════════════════════════════════════════════════════
@@ -492,7 +498,7 @@ _DATA_KEYS = _nset(
     'variables', 'constants', 'data', 'body', 'payload', 'input', 'output',
     'args', 'arguments', 'params', 'parameters', 'extra', 'extraInfo',
     'splitPoint', 'coordinatorDoc', 'event', 'response')
-# Payload documents: in --pii mode EVERY leaf is redacted (no field-name
+# Payload documents: EVERY leaf is redacted (no field-name
 # heuristics), since there is nothing structural worth preserving.
 _DATA_FORCE_KEYS = _nset(
     'documents', 'document', 'doc', 'o', 'o2', 'crud', 'oplogEntry',
@@ -632,10 +638,14 @@ class Obfuscator:
                  arg_server_redaction=False, arg_schema_file=None):
         self.logfile = arg_logfile
         self.seed = str(arg_seed) if arg_seed is not None else None
-        self.server_redaction = bool(arg_server_redaction)
-        self.strict = bool(arg_strict)
+        # DEFAULT POLICY (not options any more): deep field-by-field walk (pii), every
+        # literal redacted (strict) with the server's own rules and "###" mask
+        # (server_redaction).  The arg_pii / arg_strict / arg_server_redaction parameters
+        # are kept only so existing callers keep working; they are ignored.
+        self.server_redaction = True
+        self.strict = True
         self.single_pass = bool(arg_single_pass)
-        self.pii = bool(arg_pii) or self.strict or self.server_redaction
+        self.pii = True
         self.add_fields = [f.strip() for f in (arg_add_fields or [])]
         # --loadSchemaFile: default + schema + --addFields  (a plain union).  Flat names join
         # the --addFields set and so get exactly its scope-independent matching; dotted
@@ -714,12 +724,19 @@ class Obfuscator:
 
     # ── Replacement strategies ────────────────────────────────────────────────
 
+    def _pick(self, pool, raw, tag=''):
+        """Deterministic word for `raw`: derived from an HMAC under the run key, not drawn
+        from a shared random stream.  With --seed the same value maps to the same word in
+        every file, in any order and with any combination of options; without a seed the
+        key is random per run."""
+        return pool[int(self._h(f'pick:{tag}:{raw}', 8), 16) % len(pool)]
+
     def _fruit_for(self, raw):
         """Map raw string to a deterministic fruit/colour/adjective word."""
-        return self.replacements.setdefault(raw, choice(fruits))
+        return self.replacements.setdefault(raw, self._pick(fruits, raw, 'f'))
 
     def _color_for(self, raw):
-        return self.replacements.setdefault(raw, choice(colors))
+        return self.replacements.setdefault(raw, self._pick(colors, raw, 'c'))
 
     def _hash_for(self, raw):
         key = json.dumps(raw, sort_keys=True) if not isinstance(raw, str) else raw
@@ -795,11 +812,11 @@ class Obfuscator:
                 elif self._use_char_replace_for_key():
                     part = _char_replace(part)
                 elif i == len(parts) - 1:
-                    part = self.replacements.setdefault(part, choice(fruits))
+                    part = self.replacements.setdefault(part, self._pick(fruits, part, 'f'))
                 elif i == len(parts) - 2:
-                    part = self.replacements.setdefault(part, choice(colors))
+                    part = self.replacements.setdefault(part, self._pick(colors, part, 'c'))
                 else:
-                    part = self.replacements.setdefault(part, choice(adjectives))
+                    part = self.replacements.setdefault(part, self._pick(adjectives, part, 'a'))
             replaced.append(part)
         return '.'.join(replaced)
 
@@ -977,10 +994,10 @@ class Obfuscator:
             k = 'host:' + raw
             v = self.replacements.get(k)
             if v is None:
-                v = choice(colors) + '.' + choice(fruits) + '.invalid'
+                v = self._pick(colors, raw, 'hc') + '.' + self._pick(fruits, raw, 'hf') + '.invalid'
                 self.replacements[k] = v
             return v
-        return self.replacements.setdefault(raw, choice(fruits))
+        return self.replacements.setdefault(raw, self._pick(fruits, raw, 'f'))
 
     def _learn_local_identity(self):
         """The operator's own hostname / OS user commonly end up in logs
@@ -1364,11 +1381,11 @@ class Obfuscator:
             elif self._use_char_replace_for_key():
                 r = _char_replace(part)
             elif i == n - 1:
-                r = self.replacements.setdefault(part, choice(fruits))
+                r = self.replacements.setdefault(part, self._pick(fruits, part, 'f'))
             elif i == n - 2:
-                r = self.replacements.setdefault(part, choice(colors))
+                r = self.replacements.setdefault(part, self._pick(colors, part, 'c'))
             else:
-                r = self.replacements.setdefault(part, choice(adjectives))
+                r = self.replacements.setdefault(part, self._pick(adjectives, part, 'a'))
             self._learn(part, r)
             out.append(r)
         return '.'.join(out)
@@ -1828,6 +1845,12 @@ class Obfuscator:
             return False
         return self._schema_path_hit(tuple(self._path_segments(value[1:])))
 
+    def _ref_hit(self, value):
+        """A field reference ('$x.y') naming a schema path, an --addFields / schema field
+        or a built-in PII key: the literal compared with it is a value of that field."""
+        return (self._schema_ref_hit(value) or self._af_is_field_ref(value)
+                or self._is_pii_ref(value))
+
     def _schema_paths_walk(self, obj, chain=()):
         """Redact the value of every key whose ancestor chain ends with a schema
         path, anywhere in the entry (also inside JSON serialised in a string)."""
@@ -1838,10 +1861,10 @@ class Obfuscator:
                 if chain2 != chain and self._schema_path_hit(chain2):
                     out[k] = self._af_redact_deep(v, key=k)
                 elif k in self._AF_CMP_OPS and isinstance(v, list) and self._any_ref(
-                        v, self._schema_ref_hit):
+                        v, self._ref_hit):
                     # {"$eq": ["$customer.vipCode", "<value>"]}: the literal is the value
-                    out[k] = [x if self._schema_ref_hit(x) or (
-                                  isinstance(x, list) and self._any_ref(x, self._schema_ref_hit))
+                    out[k] = [x if self._ref_hit(x) or (
+                                  isinstance(x, list) and self._any_ref(x, self._ref_hit))
                               else self._af_redact_deep(x, key=k) for x in v]
                 else:
                     out[k] = self._schema_paths_walk(v, chain2)
@@ -1858,8 +1881,7 @@ class Obfuscator:
         """Redact ONE parsed log entry.  Every key at every depth is visited:
         t/s/c/ctx/id/msg/attr/tags/truncated/size and any unknown extras."""
         entry = _mask_bindata(entry)                 # S1, every context
-        if self._schema_path_norm:
-            entry = self._schema_paths_walk(entry)  # --loadSchemaFile dotted paths
+        entry = self._schema_paths_walk(entry)        # dotted paths + field refs ($eq / $in)
         if not isinstance(entry, dict):
             return self._sweep(entry)
         out = {}
@@ -1962,8 +1984,6 @@ class Obfuscator:
     # ── Main entry point ──────────────────────────────────────────────────────
 
     def run(self):
-        if self.seed is not None:
-            rseed(self.seed)
         for n, kind in sorted(self._pending_local):
             self._alias(n, kind)
         if not self.single_pass:
@@ -2286,16 +2306,12 @@ if __name__ == '__main__':
         '--seed', '-s', metavar='S', default=None,
         help='Seed the random number generator with S (any string). '
              'Same seed on the same log always produces the same output.')
+    # Deprecated no-ops: these behaviours are the DEFAULT policy now (hidden from --help).
+    log_group.add_argument('--pii', action='store_true', default=False, help=argparse.SUPPRESS)
+    log_group.add_argument('--strict', action='store_true', default=False, help=argparse.SUPPRESS)
     log_group.add_argument(
-        '--pii', action='store_true', default=False,
-        help='Enable deep PII obfuscation: walks into attr.command values '
-             '(emails, URLs, user data, nested objects/arrays) instead of '
-             'hashing the whole command blob.')
-    log_group.add_argument(
-        '--strict', action='store_true', default=False,
-        help='Implies --pii.  Redact EVERY literal value inside query / update '
-             '/ pipeline / document subtrees, not only values of known PII '
-             'field names.  Field names and operators are preserved.')
+        '--server_redaction', '--redactClientLogData', dest='server_redaction',
+        action='store_true', default=False, help=argparse.SUPPRESS)
     log_group.add_argument(
         '--loadSchemaFile', metavar='FILE', default=None,
         help='JSON file listing extra fields to obfuscate: {"fields": [names at any depth], '
@@ -2304,14 +2320,6 @@ if __name__ == '__main__':
              'schema + --addFields (union).  Uses the fruit words, or x-pattern with '
              '--char_replacement.')
     log_group.add_argument(
-        '--server_redaction', '--redactClientLogData', dest='server_redaction',
-        action='store_true', default=False,
-        help='Emulate the server\'s security.redactClientLogData=true on client-data '
-             'attributes: BSON redaction level "all" (every scalar of any type -> "###", '
-             'keys and structure kept) and Status / exception text -> "CodeName: ###". '
-             'Implies --pii.  The mask is always "###" (ignores --char_replacement for '
-             'those values).  BinData Encrypt/Sensitive masking is always on.')
-    log_group.add_argument(
         '--single_pass', action='store_true', default=False,
         help='Skip the name-learning pre-pass (about 2x faster).  Names are '
              'then only replaced in free text AFTER the line that first '
@@ -2319,7 +2327,7 @@ if __name__ == '__main__':
     log_group.add_argument(
         '--addFields', metavar='FIELDS', default=None,
         help="Comma-separated list of extra command-level field names to "
-             "obfuscate when --pii is active (e.g. '$comment,_tid').")
+             "obfuscate, in every scope, on top of the default policy (e.g. '$comment,_tid').")
     log_group.add_argument(
         '--redactNamespaces', action='store_true', default=False,
         help='Replace every database name and collection name with a stable '
@@ -2361,6 +2369,13 @@ if __name__ == '__main__':
         add_fields = None
         if args.addFields:
             add_fields = [f.strip() for f in args.addFields.split(',') if f.strip()]
+
+        deprecated = [f for f, v in (('--pii', args.pii), ('--strict', args.strict),
+                                     ('--server_redaction/--redactClientLogData',
+                                      args.server_redaction)) if v]
+        if deprecated:
+            sys.stderr.write('note: %s ignored: deep PII, strict and server-style redaction '
+                             'are the default policy now.\n' % ', '.join(deprecated))
 
         char_fields = None
         if args.char_fields:

@@ -733,20 +733,15 @@ def luhn(d):
 # Tests
 # ══════════════════════════════════════════════════════════════════════════════
 
-MATRIX = {
+MATRIX = {          # the DEFAULT policy (deep PII + every literal + server-style) always applies
     'default':              [],
-    'pii':                  ['--pii'],
-    'pii_seed':             ['--pii', '--seed', 'it-seed'],
-    'pii_redactns':         ['--pii', '--redactNamespaces'],
-    'pii_x':                ['--pii', '--char_replacement'],
-    'everything':           ['--pii', '--seed', 'it', '--char_replacement',
+    'seed':                 ['--seed', 'it-seed'],
+    'redactns':             ['--redactNamespaces'],
+    'x':                    ['--char_replacement'],
+    'everything':           ['--seed', 'it', '--char_replacement',
                              '--redactNamespaces', '--addFields', '$comment,_tid,grId'],
-    'strict':               ['--strict'],
-    'strict_x_redactns':    ['--strict', '--char_replacement', '--redactNamespaces', '--seed', 'k'],
-    'single_pass':          ['--pii', '--single_pass'],
-    'server_redaction':     ['--server_redaction'],
-    'server_redaction_x':   ['--server_redaction', '--char_replacement',
-                             '--redactNamespaces', '--seed', 'k'],
+    'x_redactns_seed':      ['--char_replacement', '--redactNamespaces', '--seed', 'k'],
+    'single_pass':          ['--single_pass'],
 }
 
 SCHEMA_CMD_KEYS = ('sort', 'hint', 'projection', 'fields', 'key')
@@ -873,12 +868,11 @@ class RealLogs(CompactAsserts):
     # -- 1. leak matrix ---------------------------------------------------------
     def _matrix_case(self, label):
         flags = MATRIX[label]
-        strict_like = '--strict' in flags
         single = '--single_pass' in flags      # names are order-dependent by design
         canaries = (self.canaries('listed') + self.canaries('bindata')
                     + ([] if single else self.canaries('names'))
                     + ([] if single else self.env_canaries())
-                    + (self.canaries('strict') if strict_like else [])
+                    + self.canaries('strict')          # unlisted fields: default policy removes them
                     + (self.canaries('addfields') if '--addFields' in flags else []))
         ips, _ = self.source_hosts_and_ips()
         problems = []
@@ -921,33 +915,34 @@ class RealLogs(CompactAsserts):
         self.assertEqual(problems[:12], [], f'{label}: {len(problems)} problem(s)')
 
     def test_10_matrix_default(self):           self._matrix_case('default')
-    def test_11_matrix_pii(self):               self._matrix_case('pii')
-    def test_12_matrix_pii_seed(self):          self._matrix_case('pii_seed')
-    def test_13_matrix_pii_redactns(self):      self._matrix_case('pii_redactns')
-    def test_14_matrix_pii_x(self):             self._matrix_case('pii_x')
-    def test_15_matrix_everything(self):        self._matrix_case('everything')
-    def test_16_matrix_strict(self):            self._matrix_case('strict')
-    def test_17_matrix_strict_x_redactns(self): self._matrix_case('strict_x_redactns')
-    def test_18_matrix_single_pass(self):       self._matrix_case('single_pass')
+    def test_11_matrix_seed(self):              self._matrix_case('seed')
+    def test_12_matrix_redactns(self):          self._matrix_case('redactns')
+    def test_13_matrix_x(self):                 self._matrix_case('x')
+    def test_14_matrix_everything(self):        self._matrix_case('everything')
+    def test_15_matrix_x_redactns_seed(self):   self._matrix_case('x_redactns_seed')
+    def test_16_matrix_single_pass(self):       self._matrix_case('single_pass')
 
-    def test_18b_matrix_server_redaction(self):     self._matrix_case('server_redaction')
-    def test_18c_matrix_server_redaction_x(self):   self._matrix_case('server_redaction_x')
-
-    def test_19_addfields_removes_custom_field_in_filters(self):
-        """grId is NOT a built-in PII key: plain --pii must keep it in a filter
-        while --addFields grId removes it everywhere."""
-        with_af = ''.join(_ofuscate(p, '--pii', '--addFields', 'grId').stdout
+    def test_19_addfields_removes_custom_field(self):
+        with_af = ''.join(_ofuscate(p, '--addFields', 'grId').stdout
                           for p in STATE['logs'].values())
         for c in C['addfields']:
             self.assertNotIn(c, with_af)
 
-    def test_20_strict_removes_unlisted_values(self):
-        plain = ''.join(_ofuscate(p, '--pii').stdout for p in STATE['logs'].values())
-        strict = ''.join(_ofuscate(p, '--strict').stdout for p in STATE['logs'].values())
+    def test_20_default_removes_values_of_unlisted_fields(self):
+        """Used to need --strict: values of field names the tool has never heard of
+        ('unlistedField', 'notes', 'nickname' ...) are removed by the DEFAULT policy."""
+        out = ''.join(_ofuscate(p).stdout for p in STATE['logs'].values())
         for c in C['strict']:
-            self.assertNotIn(c, strict, f'--strict left {c}')
-        # documented behaviour: unlisted FILTER values survive plain --pii
-        self.assertIn('filter-unlisted-canary-9', plain)
+            self.assertNotIn(c, out, f'default policy left {c}')
+
+    def test_21_deprecated_flags_are_accepted_and_ignored(self):
+        path = STATE['logs'][sorted(STATE['logs'])[0]]
+        base = _ofuscate(path, '--seed', 'z')
+        for flags in (['--pii'], ['--strict'], ['--server_redaction'], ['--redactClientLogData']):
+            p = _ofuscate(path, *flags, '--seed', 'z')
+            self.assertEqual(p.returncode, 0)
+            self.assertEqual(p.stdout, base.stdout, flags)
+            self.assertIn('ignored', p.stderr)
 
     # -- 2. independent shape scan (does not know our canaries) ------------
     def _string_leaves(self, text):
@@ -960,7 +955,7 @@ class RealLogs(CompactAsserts):
     def test_30_shape_scan_x_mode(self):
         """In x-pattern mode no PII *shape* may remain in any string."""
         for name, path in STATE['logs'].items():
-            strings = self._string_leaves(_ofuscate(path, '--strict', '--char_replacement').stdout)
+            strings = self._string_leaves(_ofuscate(path, '--char_replacement').stdout)
             for s_ in strings:
                 self.assertEqual([e for e in EMAIL.findall(s_) if not is_mask(e)], [], (name, s_[:80]))
                 self.assertEqual(SSN.findall(s_), [], (name, s_[:80]))
@@ -975,7 +970,7 @@ class RealLogs(CompactAsserts):
     def test_31_shape_scan_word_mode(self):
         from ofuscator import fruits, colors
         for name, path in STATE['logs'].items():
-            for s_ in self._string_leaves(_ofuscate(path, '--strict').stdout):
+            for s_ in self._string_leaves(_ofuscate(path).stdout):
                 for e in EMAIL.findall(s_):
                     local, dom = e.split('@')
                     self.assertTrue(dom.endswith('.com') and dom[:-4] in colors and local in fruits,
@@ -1009,8 +1004,7 @@ class RealLogs(CompactAsserts):
             self.assertEqual(bad[:5], [], f'{name}: coverage differs between styles ({len(bad)})')
 
     def test_40_parity_default(self):       self._parity()
-    def test_41_parity_pii(self):           self._parity('--pii')
-    def test_42_parity_strict_redactns(self): self._parity('--strict', '--redactNamespaces')
+    def test_41_parity_redactns(self):      self._parity('--redactNamespaces')
 
     # -- 4. the redacted log is still a usable log ------------------------------
     def test_50_redacted_logs_remain_parseable(self):
@@ -1021,7 +1015,7 @@ class RealLogs(CompactAsserts):
         for name, path in STATE['logs'].items():
             red = os.path.join(STATE['derived'], 'redacted_' + name)
             with open(red, 'w') as fh:
-                fh.write(_ofuscate(path, '--pii').stdout)
+                fh.write(_ofuscate(path).stdout)
             first = read_lines(red)[0]
             if STATE['is_json']:
                 self.assertEqual(logv2_problems(json.loads(first)), [])
@@ -1049,7 +1043,7 @@ class RealLogs(CompactAsserts):
                 'ok', 'queryHash', 'planCacheKey')
         for name, path in STATE['logs'].items():
             src = [json.loads(x) for x in read_lines(path)]
-            out = [json.loads(x) for x in _ofuscate(path, '--pii').stdout.splitlines()]
+            out = [json.loads(x) for x in _ofuscate(path).stdout.splitlines()]
             for so, oo in zip(src, out):
                 for k in safe:
                     if k in so.get('attr', {}) and isinstance(so['attr'][k], (int, float)):
@@ -1059,18 +1053,31 @@ class RealLogs(CompactAsserts):
                              [(e['c'], e['id'], e['msg']) for e in out])
 
     def test_52_system_namespaces_and_loopback_kept(self):
-        src = '\n'.join(self.source_text().values())
-        out = ''.join(_ofuscate(p, '--pii', '--redactNamespaces').stdout
-                      for p in STATE['logs'].values())
-        checked = 0
-        for keep in ('config.system.sessions', 'local.oplog.rs', 'admin.$cmd',
-                     'config.$cmd', 'config.collections', 'config.shards'):
-            if keep in src:
-                self.assertIn(keep, out)
-                checked += 1
-        self.assertGreater(checked, 1, 'no system namespaces found in the source logs')
-        self.assertIn('127.0.0.1', out)
-        # the user namespace embedded in an internal cache collection IS redacted
+        """Namespace ATTRIBUTES (ns / namespace) of system databases stay readable and
+        loopback addresses stay; a user namespace embedded in an internal cache collection
+        is redacted.  (Namespaces inside command bodies are client data: masked, like the
+        server does.)"""
+        system_prefixes = ('config.', 'local.', 'admin.$cmd', 'admin.system.')
+        kept = 0
+        loop = 0
+        for name, path in STATE['logs'].items():
+            src = [json.loads(x) for x in read_lines(path)]
+            out = [json.loads(x) for x in _ofuscate(path, '--redactNamespaces').stdout.splitlines()]
+            for so, oo in zip(src, out):
+                for key in ('ns', 'namespace'):
+                    v = so.get('attr', {}).get(key)
+                    if isinstance(v, str) and v.startswith(system_prefixes) \
+                            and not v.startswith('config.cache.chunks.'):
+                        self.assertEqual(oo['attr'][key], v, (name, key, v))
+                        kept += 1
+                r = so.get('attr', {}).get('remote')
+                if isinstance(r, str) and r.startswith('127.0.0.1:'):
+                    self.assertEqual(oo['attr']['remote'], r)
+                    loop += 1
+        sys.stderr.write(f'\n[test] system namespace attrs kept: {kept}; loopback remotes kept: {loop}\n')
+        self.assertGreater(kept, 20)
+        self.assertGreater(loop, 5)
+        out = ''.join(_ofuscate(p, '--redactNamespaces').stdout for p in STATE['logs'].values())
         self.assertNotRegex(out, r'config\.cache\.chunks\.acmeshopdb')
 
     # -- 4b. server-side redaction policy (redaction.cpp / log_util.cpp / bsonobj.cpp) --------
@@ -1082,19 +1089,20 @@ class RealLogs(CompactAsserts):
         shown = {c: c in src for c in C['bindata']}
         sys.stderr.write(f'\n[test] BinData 6/8 base64 present in the SOURCE logs of this '
                          f'server version: {shown}  (False = the server already masked it)\n')
-        for flags in ([], ['--pii'], ['--strict'], ['--pii', '--char_replacement'],
-                      ['--server_redaction']):
+        for flags in ([], [], [], ['--char_replacement'],
+                      []):
             out = ''.join(_ofuscate(p, *flags).stdout for p in STATE['logs'].values())
             for c in C['bindata']:
                 self.assertNotIn(c, out, (flags, c))
 
-    def test_54_server_redaction_equals_reference_model_on_real_logs(self):
-        """--server_redaction output of every real command == the model of
-        BSONObj::redact(all): all leaves '###', keys / structure identical."""
+    def test_54_default_equals_server_reference_model_on_real_logs(self):
+        """The DEFAULT output of every real command == the model of BSONObj::redact(all)
+        (what the server writes with redactClientLogData=true): all leaves '###',
+        keys / structure identical."""
         checked = 0
         for name, path in STATE['logs'].items():
             src = [json.loads(x) for x in read_lines(path)]
-            out = [json.loads(x) for x in _ofuscate(path, '--server_redaction').stdout.splitlines()]
+            out = [json.loads(x) for x in _ofuscate(path).stdout.splitlines()]
             for so, oo in zip(src, out):
                 for ck in ('command', 'originatingCommand'):
                     sc = so.get('attr', {}).get(ck)
@@ -1105,14 +1113,14 @@ class RealLogs(CompactAsserts):
                         checked += 1
         self.assertGreater(checked, 50)
 
-    def test_55_server_redaction_status_forms_and_fixpoint(self):
+    def test_55_default_status_forms_and_fixpoint(self):
         forms = collections.Counter()
         for name, path in STATE['logs'].items():
-            first = _ofuscate(path, '--server_redaction').stdout
+            first = _ofuscate(path).stdout
             again = os.path.join(STATE['derived'], 'sr_' + name)
             with open(again, 'w') as fh:
                 fh.write(first)
-            second = _ofuscate(again, '--server_redaction').stdout
+            second = _ofuscate(again).stdout
             for a, b in zip(first.splitlines(), second.splitlines()):
                 a, b = json.loads(a), json.loads(b)
                 for ck in ('command', 'originatingCommand'):      # fixpoint on client data
@@ -1131,6 +1139,23 @@ class RealLogs(CompactAsserts):
         self.assertGreater(sum(forms.values()), 3)
 
     # -- 4c. --loadSchemaFile x --addFields: default | +schema | +fields | +both ----------------
+    def _derived_log_with_schema_fields(self):
+        """A REAL mongos log plus one injected entry that carries the schema fields in a
+        container that is not client data (client data is masked by the default policy
+        whatever the options are, so only such containers can show the rule)."""
+        src = STATE['logs'][sorted(STATE['logs'])[-2]]            # a real log
+        lines = read_lines(src)
+        probe = {"t": {"$date": "2026-10-07T12:00:00.000+00:00"}, "s": "I", "c": "COMMAND", "id": 99999,
+                 "ctx": "conn1", "msg": "generic attrs", "attr": {
+                     "grId": 'grid-canary-xyz-001', "tenantRef": 'schema-canary-tenantref-77',
+                     "customer": {"vipCode": 'schema-canary-path-vip-1'},
+                     "loyalty": {"tier": 'schema-canary-nested-tier-9'},
+                     "vendor": {"vipCode": 'keep-canary-vendor-vip-5'}}}
+        path = os.path.join(STATE['derived'], 'with_probe.log')
+        with open(path, 'w') as fh:
+            fh.write('\n'.join(lines + [json.dumps(probe)]) + '\n')
+        return path
+
     def test_56_schema_file_and_add_fields_combinations(self):
         schema = os.path.join(STATE['derived'], 'schema.json')
         with open(schema, 'w') as fh:
@@ -1138,46 +1163,51 @@ class RealLogs(CompactAsserts):
         src = '\n'.join(self.source_text().values())
         for c in C['schema'] + C['schema_keep'] + C['addfields'][:1]:
             self.assertIn(c, src, f'{c!r} never reached the logs')
+        derived = self._derived_log_with_schema_fields()
         combos = {'none': ([], False), 'schema': (['--loadSchemaFile', schema], True),
                   'addFields': (['--addFields', 'grId'], False),
                   'schema+addFields': (['--loadSchemaFile', schema, '--addFields', 'grId'], True)}
         for label, (opts, use_schema) in combos.items():
             use_add = 'grId' in opts
             for style in ([], ['--char_replacement']):
-                for extra in (['--pii'], ['--pii', '--redactNamespaces', '--seed', 'k']):
-                    out = ''
-                    for path in STATE['logs'].values():
-                        p = _ofuscate(path, *opts, *extra, *style)
-                        self.assertEqual(p.returncode, 0, p.stderr[-300:])
-                        out += p.stdout
+                for extra in ([], ['--redactNamespaces', '--seed', 'k']):
                     tag = (label, style, extra)
-                    for c in C['schema']:             # requested only through the schema file
-                        (self.assertNotIn if use_schema else self.assertIn)(c, out, tag + (c,))
-                    for c in C['addfields'][:1]:      # requested only through --addFields
-                        (self.assertNotIn if use_add else self.assertIn)(c, out, tag + (c,))
-                    # default rules only: the un-asked field (and the non-matching path) stay visible
-                    for c in C['schema_keep']:
-                        self.assertIn(c, out, tag + (c,))
-                    # and whatever the combination: the built-in PII rules still apply
-                    for c in ('alice.smith@acme-corp.com', '123-45-6789', '4111111111111111'):
+                    # (a) the injected entry: default | +schema | +fields | +both
+                    p = _ofuscate(derived, *opts, *extra, *style)
+                    self.assertEqual(p.returncode, 0, p.stderr[-300:])
+                    probe_out = p.stdout.splitlines()[-1]
+                    for c in C['schema']:
+                        (self.assertNotIn if use_schema else self.assertIn)(c, probe_out, tag + (c,))
+                    for c in C['addfields'][:1]:
+                        (self.assertNotIn if use_add else self.assertIn)(c, probe_out, tag + (c,))
+                    self.assertIn('keep-canary-vendor-vip-5', probe_out, tag)   # no rule matches it
+                    # (b) the real client data of all three logs: masked in EVERY combination
+                    out = ''.join(_ofuscate(path, *opts, *extra, *style).stdout
+                                  for path in STATE['logs'].values())
+                    for c in C['schema'] + C['schema_keep'] + C['addfields'] + [
+                            'alice.smith@acme-corp.com', '123-45-6789', '4111111111111111']:
                         self.assertNotIn(c, out, tag + (c,))
 
-    def test_57_schema_file_with_strict_and_server_redaction_is_additive(self):
+    def test_57_schema_file_with_addfields_is_additive_and_deterministic(self):
         schema = os.path.join(STATE['derived'], 'schema.json')
         with open(schema, 'w') as fh:
             json.dump(SCHEMA_DOC, fh)
-        for extra in (['--strict'], ['--server_redaction'], ['--server_redaction', '--char_replacement']):
-            out = ''.join(_ofuscate(p, '--loadSchemaFile', schema, '--addFields', 'grId', *extra).stdout
-                          for p in STATE['logs'].values())
-            for c in C['schema'] + C['addfields']:
-                self.assertNotIn(c, out, (extra, c))
+        derived = self._derived_log_with_schema_fields()
+        flags = ['--loadSchemaFile', schema, '--addFields', 'grId', '--seed', 'abc']
+        a = _ofuscate(derived, *flags).stdout
+        b = run([sys.executable, SCRIPT, '--log_redact', derived, *flags]).stdout
+        self.assertEqual(a, b)                                           # same seed -> same output
+        base = _ofuscate(derived, '--seed', 'abc').stdout.splitlines()
+        added = a.splitlines()
+        self.assertEqual(base[:-1], added[:-1])      # the real lines do not change at all
+        self.assertNotEqual(base[-1], added[-1])     # only the injected entry gains redactions
 
     # -- 5. determinism, salting, robustness -----------------------------------
     def test_60_seed_determinism_and_salting(self):
         path = next(iter(STATE['logs'].values()))
-        a = run([sys.executable, SCRIPT, '--log_redact', path, '--pii', '--seed', 'abc']).stdout
-        b = run([sys.executable, SCRIPT, '--log_redact', path, '--pii', '--seed', 'abc']).stdout
-        c = run([sys.executable, SCRIPT, '--log_redact', path, '--pii', '--seed', 'abd']).stdout
+        a = run([sys.executable, SCRIPT, '--log_redact', path, '--seed', 'abc']).stdout
+        b = run([sys.executable, SCRIPT, '--log_redact', path, '--seed', 'abc']).stdout
+        c = run([sys.executable, SCRIPT, '--log_redact', path, '--seed', 'abd']).stdout
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
         u1 = run([sys.executable, SCRIPT, '--log_redact', path, '--redactNamespaces']).stdout
@@ -1186,7 +1216,7 @@ class RealLogs(CompactAsserts):
 
     def test_61_no_unsalted_md5_of_sensitive_values(self):
         import hashlib
-        text = ''.join(_ofuscate(p, '--pii').stdout + _ofuscate(p).stdout
+        text = ''.join(_ofuscate(p).stdout + _ofuscate(p).stdout
                        for p in STATE['logs'].values())
         for v in C['listed'] + C['names']:
             md5 = hashlib.md5(v.encode()).hexdigest()
@@ -1197,8 +1227,8 @@ class RealLogs(CompactAsserts):
         path = next(p for n, p in STATE['logs'].items() if 'mongos' in n)
         first = os.path.join(STATE['derived'], 'pass1_' + os.path.basename(path))
         with open(first, 'w') as fh:
-            fh.write(_ofuscate(path, '--pii').stdout)
-        again = run([sys.executable, SCRIPT, '--log_redact', first, '--pii'])
+            fh.write(_ofuscate(path).stdout)
+        again = run([sys.executable, SCRIPT, '--log_redact', first])
         self.assertEqual(again.returncode, 0, again.stderr[-500:])
         for ln in again.stdout.splitlines():
             json.loads(ln)
@@ -1216,7 +1246,7 @@ class RealLogs(CompactAsserts):
                     fh.write('Oct  7 host mongos[1]: ' + ln + '\n')   # syslog prefix
                 else:
                     fh.write(ln + '\n')
-        p = run([sys.executable, SCRIPT, '--log_redact', damaged, '--pii'])
+        p = run([sys.executable, SCRIPT, '--log_redact', damaged])
         self.assertEqual(p.returncode, 0, p.stderr[-500:])
         out = [x for x in p.stdout.splitlines() if x.strip()]
         self.assertEqual(len(out), len(lines[:300]))
@@ -1280,7 +1310,7 @@ class GroundTruth(CompactAsserts):
         plain = STATE['logs']
         for name, gpath in STATE['gt_logs'].items():
             ours = self._commands([json.loads(x) for x in
-                                   _ofuscate(plain[name], '--server_redaction').stdout.splitlines()],
+                                   _ofuscate(plain[name]).stdout.splitlines()],
                                   selector=self._lines(plain[name]))
             theirs = self._commands(self._lines(gpath))
             only_ours = set(ours) - set(theirs)
@@ -1321,7 +1351,7 @@ class GroundTruth(CompactAsserts):
         shown = []
         for name, gpath in STATE['gt_logs'].items():
             ours = forms([json.loads(x) for x in
-                          _ofuscate(STATE['logs'][name], '--server_redaction').stdout.splitlines()])
+                          _ofuscate(STATE['logs'][name]).stdout.splitlines()])
             theirs = forms(self._lines(gpath))
             for key in set(ours) & set(theirs):     # timing noise exists in only one cluster
                 compared += 1
@@ -1347,8 +1377,8 @@ class GroundTruth(CompactAsserts):
         visible = ['acmeshopdb', 'customer_profiles', 'AcmeBillingService', ADMIN_USER, UNKNOWN_USER]
         for name, gpath in STATE['gt_logs'].items():
             src_masks = open(gpath, encoding='utf-8', errors='replace').read().count('"###"')
-            for flags in ([], ['--pii'], ['--pii', '--char_replacement'], ['--strict'],
-                          ['--server_redaction']):
+            for flags in ([], [], ['--char_replacement'], [],
+                          []):
                 p = _ofuscate(gpath, *flags)
                 self.assertEqual(p.returncode, 0, p.stderr[-300:])
                 outl = [json.loads(x) for x in p.stdout.splitlines()]
@@ -1356,7 +1386,7 @@ class GroundTruth(CompactAsserts):
                 self.assertGreaterEqual(p.stdout.count('"###"'), src_masks, (name, flags))
                 for n in visible:               # what the server left visible is now gone
                     self.assertNotIn(n, p.stdout, (name, flags, n))
-            fix = _ofuscate(gpath, '--server_redaction').stdout.splitlines()
+            fix = _ofuscate(gpath).stdout.splitlines()
             glines = self._lines(gpath)
             # the first commands (profile / setParameter) ran BEFORE redactClientLogData
             # was switched on: the server logged those in clear

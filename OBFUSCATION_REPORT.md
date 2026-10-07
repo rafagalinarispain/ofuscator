@@ -1,5 +1,7 @@
 # MongoDB Log Obfuscation Tool Benchmark Report
 
+> **Note (historical report).** This benchmark was run with an earlier version of the tool, invoked as `--pii --addFields ... --seed ... --char_replacement --redactNamespaces`. Deep PII walking, every-literal redaction and the server-style rules are the **default policy** in the current version (`--pii`, `--strict`, `--server_redaction` are accepted and ignored), and the current version is stricter than the one measured here. See [README.md](./README.md) and [TEST_RESULTS.md](./TEST_RESULTS.md).
+
 **Date:** September 15, 2026
 **MongoDB version tested:** **5.0.31** (latest 5.0 minor, installed via `m 5.0.31`)
 **Log format:** MongoDB structured JSON v2 (4.4+, unchanged through 5.0)

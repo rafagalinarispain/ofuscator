@@ -5,23 +5,28 @@ structured log schema
 ([`docs/logging.md`](https://github.com/mongodb/mongo/blob/master/docs/logging.md):
 `t`, `s`, `c`, `ctx`, `id`, `msg`, `attr`, `tags`, `truncated`, `size`).
 
+**Policy under test.** With no options the tool applies the server-style policy to client data
+(every literal `###`, keys and structure kept, BinData 6/8 masked, Status `CodeName: ###`) plus
+redaction of hosts, IPs, users, apps, namespaces, secrets and PII shapes in every string.
+`--pii`, `--strict` and `--server_redaction` are not options any more: they are the default.
+
 | Suite | File | Tests | Result |
 |-------|------|------:|--------|
-| Unit / synthetic corpus | `test_ofuscator.py` | 63 | **63 / 63 pass** |
-| Real cluster (`m` + `mtools`), MongoDB 4.4.29 | `test_integration_mongo.py` | 32 (+4 ground-truth skipped) | **32 / 32 pass** |
-| Real cluster, MongoDB 5.0.31 | `test_integration_mongo.py` | 32 (+4 skipped) | **32 / 32 pass** |
-| Real cluster, MongoDB 6.0.29 | `test_integration_mongo.py` | 32 (+4 skipped) | **32 / 32 pass** |
-| Real cluster, MongoDB 7.0.43 | `test_integration_mongo.py` | 32 (+4 skipped) | **32 / 32 pass** |
-| Real cluster, MongoDB 8.0.32 | `test_integration_mongo.py` | 32 (+4 skipped) | **32 / 32 pass** |
-| Real cluster + **ground truth** vs an enterprise server redacting its own logs, 5.0.31-ent | `test_integration_mongo.py --ground-truth` | 36 | **36 / 36 pass** |
-| Real cluster + ground truth, 7.0.17-ent | `test_integration_mongo.py --ground-truth` | 36 | **36 / 36 pass** |
-| Real cluster + ground truth, 8.0.17-ent | `test_integration_mongo.py --ground-truth` | 36 | **36 / 36 pass** |
+| Unit / synthetic corpus | `test_ofuscator.py` | 62 | **62 / 62 pass** |
+| Real cluster (`m` + `mtools`), MongoDB 4.4.29 | `test_integration_mongo.py` | 28 (+4 ground-truth skipped) | **28 / 28 pass** |
+| Real cluster, MongoDB 5.0.31 | `test_integration_mongo.py` | 28 (+4 skipped) | **28 / 28 pass** |
+| Real cluster, MongoDB 6.0.29 | `test_integration_mongo.py` | 28 (+4 skipped) | **28 / 28 pass** |
+| Real cluster, MongoDB 7.0.43 | `test_integration_mongo.py` | 28 (+4 skipped) | **28 / 28 pass** |
+| Real cluster, MongoDB 8.0.32 | `test_integration_mongo.py` | 28 (+4 skipped) | **28 / 28 pass** |
+| Real cluster + **ground truth** vs an enterprise server redacting its own logs, 5.0.31-ent | `test_integration_mongo.py --ground-truth` | 32 | **32 / 32 pass** |
+| Real cluster + ground truth, 7.0.17-ent | `test_integration_mongo.py --ground-truth` | 32 | **32 / 32 pass** |
+| Real cluster + ground truth, 8.0.17-ent | `test_integration_mongo.py --ground-truth` | 32 | **32 / 32 pass** |
 
 Run date: 2026-10-07. Environment: macOS 26.7.1 arm64 (pre-6.0 servers run
 under Rosetta), Python 3.9.6, pymongo 4.11.1, mtools 1.7.2, `m` 1.9.0.
 
 ```bash
-python3 test_ofuscator.py -v                     # unit suite, ~3 s
+python3 test_ofuscator.py -v                     # unit suite, ~10 s
 python3 test_integration_mongo.py 5.0            # real cluster, ~2 min
 python3 test_integration_mongo.py 5.0.31-ent --ground-truth   # + enterprise server as the reference, ~3 min
 ```
@@ -30,19 +35,16 @@ python3 test_integration_mongo.py 5.0.31-ent --ground-truth   # + enterprise ser
 
 ## 1. Before / after the fixes
 
-The same 30-entry synthetic corpus (61 canary values of fake PII) was run
-against the original script and the final script. A canary "leaks" when it
-appears anywhere in the output.
+The same 30-entry synthetic corpus (61 canary values of fake PII) was run against the
+original script and the final script. A canary "leaks" when it appears anywhere in the output.
+(The "before" runs used the options of that time; today's default is stricter than all of them.)
 
-| Flags | Leaked before | Leaked after |
-|-------|--------------:|-------------:|
-| default | 45 / 61 | 0 |
-| `--pii` | 50 / 61 | 0 (`*`) |
-| `--pii --redactNamespaces --char_replacement --seed` | 41 / 61 | 0 (`*`) |
-
-`*` The only canaries that remain under plain `--pii` are the ones placed in
-field names that are neither built-in PII keys nor listed in `--addFields`
-(documented behaviour; `--strict` removes them, see tests 16/20).
+| Run | Leaked before | Leaked after |
+|-----|--------------:|-------------:|
+| original script, default | 45 / 61 | 0 |
+| original script `--pii` | 50 / 61 | 0 |
+| original script `--pii --redactNamespaces --char_replacement --seed` | 41 / 61 | 0 |
+| final script, default (includes the values of unlisted fields) | - | 0 / 61 |
 
 ### Breaches found and fixed
 
@@ -79,86 +81,87 @@ field names that are neither built-in PII keys nor listed in `--addFields`
 | 29 | Path specs were not applied to free text (`customer.vipCode: <value>`): the error-text pipeline read the dotted name as `db.collection` before the field matcher ran | new schema unit matrix |
 | 30 | Field references inside an operand array were not detected, for schema paths **and for built-in PII keys**: `{"$in": ["<value>", ["$customer.vipCode"]]}`, `{"$in": ["<value>", ["$email"]]}` | new schema unit matrix |
 | 31 | Test fixture used `payload` as a key, which is a built-in force-redacted payload key (false over-redaction signal); and a precision expectation ignored that a path is contiguous | new schema unit matrix (test bugs) |
+| 32 | **Policy change**: deep PII walk, every-literal redaction and the server's own `redactClientLogData` rules were options (`--pii`, `--strict`, `--server_redaction`); they are now the DEFAULT, the flags are hidden no-ops | requirement |
+| 33 | Fruit / colour words came from a **shared random stream**: with the same `--seed` a name could map to different words in different files, and adding any option shifted later words (README promised consistency across files) | real-log test (`test_57`) |
+| 34 | Comparisons against an `--addFields` field or a built-in PII key outside client data (`{"$eq": ["$grId", <v>]}`, `{"$eq": ["$email", <v>]}`) left the literal in clear | new unit matrix |
+| 35 | Test assumptions encoded the old default (system namespaces expected inside command bodies, "unlisted values survive plain `--pii`") | full regression |
 
 ---
 
-## 2. Unit suite - `test_ofuscator.py` (63 tests, all pass)
+## 2. Unit suite - `test_ofuscator.py` (62 tests, all pass)
 
-Corpus: 30 logv2 entries modelled on mongod/mongos (slow queries for
-find / insert / update / delete / findAndModify / aggregate / getMore, auth,
-TLS, client metadata, replication, sharding, index builds, oplog applier,
-startup options, change streams, truncated entries), each carrying canary PII.
+Corpus: 30 logv2 entries modelled on mongod/mongos (slow queries for find / insert / update / delete /
+findAndModify / aggregate / getMore, auth, TLS, client metadata, replication, sharding, index builds, oplog applier,
+startup options, change streams, truncated entries), each carrying canary PII; plus server-policy and
+schema-file corpora.
 
 | # | Test | What it proves | Result |
 |--:|------|----------------|:------:|
-| 1 | `test_default` | no canary survives with default flags | pass |
-| 2 | `test_pii` | ... with `--pii` | pass |
-| 3 | `test_pii_seed` | ... with `--pii --seed` | pass |
-| 4 | `test_pii_redact_namespaces` | ... with `--pii --redactNamespaces` | pass |
-| 5 | `test_default_redact_namespaces` | ... with `--redactNamespaces` only | pass |
-| 6 | `test_pii_char_replacement` | ... with `--pii --char_replacement` | pass |
-| 7 | `test_everything` | ... with pii + seed + x + redactNamespaces + addFields | pass |
-| 8 | `test_strict` | `--strict` also removes values of unlisted fields | pass |
-| 9 | `test_strict_full` | `--strict` + seed + x + redactNamespaces | pass |
-| 10 | `test_structure_preserved` | `t/s/c/ctx/id/msg/attr`, counters and ids unchanged | pass |
-| 11 | `test_deterministic_with_seed` | same seed -> identical output | pass |
-| 12 | `test_leading_blank_line_still_json` | blank first line does not downgrade to text mode | pass |
-| 13 | `test_malformed_line_is_redacted_not_echoed` | truncated / syslog-prefixed lines: output stays JSON, nothing echoed to stderr | pass |
-| 14 | `test_non_dict_json_line` | list / string JSON lines are handled | pass |
-| 15 | `test_no_unsalted_md5_of_low_entropy_values` | MD5 of SSN / card / db names never appears | pass |
-| 16 | `test_redact_namespaces_tokens_salted` | `REDACTED_<hash>` tokens are HMAC, not MD5 | pass |
-| 17 | `test_system_namespaces_preserved` | `local.oplog.rs` kept | pass |
-| 18 | `test_parity_default` | x-pattern and fruit styles change exactly the same tokens | pass |
-| 19 | `test_parity_pii` | ... with `--pii` | pass |
-| 20 | `test_parity_strict` | ... with `--strict` | pass |
-| 21 | `test_parity_pii_redact_namespaces` | ... with `--pii --redactNamespaces` | pass |
-| 22 | `test_char_fields_selective_keeps_coverage` | `--char_fields` keeps full coverage | pass |
-| 23 | `test_legacy_text_log_both_styles` | pre-4.4 text log: no leaks, structure kept | pass |
-| 24 | `test_benign_fields_not_corrupted` | `mechanism`, `msg`, oplog `op` are not rewritten by learned names | pass |
-| 25 | `test_renamed_keys_never_collide_or_drop_fields` | field count preserved in both styles (fails without the fix) | pass |
-| 26 | `test_addfields_still_works` | `--addFields grId` removes a custom field | pass |
-| 27 | `ServerPolicyTests.test_s1_bindata_6_and_8_masked_in_every_context` | BinData 6/8 masked in a generic attr, a filter, a CRUD `o`, nested arrays and JSON embedded in a string, in 5 flag sets | pass |
-| 28 | `..test_s1_mask_is_the_server_mask_and_replaces_the_whole_element` | the whole `{"$binary": ..}` becomes the string `"###"` (both styles) | pass |
-| 29 | `..test_s1_other_subtypes_and_sibling_values_untouched` | like the server's `RedactSensitiveStringTest`: subtypes 0 / 4 and sibling strings stay | pass |
-| 30 | `..test_s1_legacy_extended_json_form` | `{"$binary": "..", "$type": "08"}` | pass |
-| 31 | `..test_s2_payload_documents_erase_bool_null_and_flag_ints` | bool / null / 0 / 1 / -1 / float / string in `documents` all erased | pass |
-| 32 | `..test_s2_query_structure_is_not_erased_but_pii_bool_is` | `$project` flags, `$sort` directions, `$group._id: null` kept; `hivStatus: true` erased | pass |
-| 33 | `..test_s2_update_options_are_kept` | `multi` / `upsert` stay booleans under `--strict` | pass |
-| 34 | `..test_idempotent_on_server_redacted_logs_every_mode` | a server-redacted entry (`###`, `Unauthorized: ###`, `InternalError ###`) is unchanged in 7 flag sets | pass |
-| 35 | `..test_server_redaction_matches_server_unit_tests` | the cases of the server's own `redaction_test.cpp` (`{a:1}`, `{"":1}`, `{a:"a"}`, ...) plus `$regex` operator document | pass |
-| 36 | `..test_server_redaction_matches_reference_model` | 6 realistic commands == independent model of `BSONObj::redact(all)` | pass |
-| 37 | `..test_server_redaction_schema_keys_are_still_obfuscated` | documented deviation: `sort` / `hint` / `projection` keys are aliased, values `###` | pass |
-| 38 | `..test_server_redaction_other_data_attrs_and_oplog_entry` | oplog entry (`bgsync.cpp` `lastOplogEntry`), `keyValue`, `errInfo` | pass |
-| 39 | `..test_server_redaction_status_exception_and_what_forms` | `CodeName: ###`, `Code{extra}: ..` -> `Code: ###`, `OK`, plain `what()` -> `###` | pass |
-| 40 | `..test_server_redaction_structured_status_keeps_code_drops_reason` | `{code, codeName, errmsg}` -> `errmsg: "###"` | pass |
-| 41 | `..test_server_redaction_mask_ignores_char_replacement_and_keeps_other_rules` | `###` in both styles; ns / appName / IP / email still redacted | pass |
-| 42 | `..test_server_redaction_canary_corpus_both_styles` | full synthetic corpus: 0 leaks with `--server_redaction` (+ `--redactClientLogData` alias) | pass |
-| 43 | `..test_server_redaction_rejected_for_ftdc` | log-only flag rejected in `--ftdc_redact` | pass |
-| 44 | `ServerPolicyTests.test_s2_builtin_pii_ref_inside_operand_array` | `{"$in": [<value>, ["$email"]]}` redacts the literal | pass |
-| 45 | `SchemaFileTests.test_rule_matrix` | **the rule**: none / schema / addFields / schema+addFields x fruit / x x `--pii` / `--strict` / default mode: requested fields are gone, un-requested ones stay, built-in PII always gone | pass |
-| 46 | `..test_path_precision_vendor_not_redacted_by_customer_path` | path `customer.vipCode` redacts customer only, `vendor.vipCode` stays in 6 contexts | pass |
-| 47 | `..test_path_is_contiguous_bare_name_matches_any_depth` | `customer.items.$[e].vipCode` is another path; a bare `vipCode` matches at any depth | pass |
-| 48 | `..test_path_in_aggregation_field_reference_and_free_text` | `$eq` / `$in` against `$customer.vipCode`, and `customer.vipCode: <v>` in an error message | pass |
-| 49 | `..test_flat_schema_field_matches_like_add_fields_everywhere` | `$in` operand, `$set`, `$expr` ref, oplog `o`, JSON string, free text | pass |
-| 50 | `..test_style_fruit_vs_x_for_schema_values` | fruit words vs `x-xxxx` pattern | pass |
-| 51 | `..test_union_equals_add_fields_with_the_same_names` | schema fields + `--addFields` == one `--addFields` with both lists (byte-identical with a seed) | pass |
-| 52 | `..test_deterministic_with_seed` | same seed -> same output | pass |
-| 53 | `..test_works_with_server_redaction_and_redact_namespaces` | combines with `--server_redaction --redactNamespaces` | pass |
-| 54 | `..test_file_formats` | array shorthand, bare nested, fields-only, paths-only, one-segment path, `false` leaf, meta keys | pass |
-| 55 | `..test_case_insensitive_dollar_optional_and_dotted_match` | `$TENANTREF`, `GrId`, `Customer.VIPCODE` | pass |
-| 56 | `..test_empty_schema_is_a_noop` | `{}`, `[]`, `{"fields": []}`, `{"paths": []}` change nothing | pass |
-| 57 | `..test_legacy_text_log` | the four combinations on a pre-4.4 text log | pass |
-| 58 | `..test_rejects_missing_file` | exit 2, one-line error | pass |
-| 59 | `..test_rejects_invalid_json` | exit 2, no traceback | pass |
-| 60 | `..test_rejects_wrong_types` | nine malformed shapes rejected | pass |
-| 61 | `..test_rejects_binary_garbage` | non-UTF-8 file rejected cleanly | pass |
-| 62 | `..test_rejected_for_ftdc` | log-only option rejected with `--ftdc_redact` | pass |
-| 63 | `..test_schema_file_content_never_echoed_on_error` | a field name in a broken file never appears in stderr | pass |
+| 1 | `LeakTests.test_default` | DEFAULT policy: none of the 61 canaries survives, **including values of unlisted field names** (used to need `--strict`) | pass |
+| 2 | `LeakTests.test_seed` | ... with `--seed` | pass |
+| 3 | `LeakTests.test_redact_namespaces` | ... with `--redactNamespaces` | pass |
+| 4 | `LeakTests.test_char_replacement` | ... with `--char_replacement` | pass |
+| 5 | `LeakTests.test_single_pass` | ... with `--single_pass` | pass |
+| 6 | `LeakTests.test_everything` | ... with seed + x-pattern + redactNamespaces + addFields | pass |
+| 7 | `LeakTests.test_deprecated_flags_are_accepted_and_ignored` | `--pii`, `--strict`, `--server_redaction`, `--redactClientLogData` (and all three together): same output as the default, hidden from `--help`, exactly one stderr note | pass |
+| 8 | `LeakTests.test_structure_preserved` | `t/s/c/ctx/id/msg/attr` and counters unchanged; `command.limit` is `###` (server masks it); operators kept | pass |
+| 9 | `LeakTests.test_deterministic_with_seed` | same seed -> identical output | pass |
+| 10 | `LeakTests.test_leading_blank_line_still_json` | blank first line does not downgrade to text mode | pass |
+| 11 | `LeakTests.test_malformed_line_is_redacted_not_echoed` | truncated / syslog-prefixed lines: output stays JSON, nothing echoed to stderr | pass |
+| 12 | `LeakTests.test_non_dict_json_line` | list / string JSON lines are handled | pass |
+| 13 | `LeakTests.test_no_unsalted_md5_of_low_entropy_values` | MD5 of SSN / card / db names never appears | pass |
+| 14 | `LeakTests.test_redact_namespaces_tokens_salted` | `REDACTED_<hash>` tokens are HMAC, not MD5 | pass |
+| 15 | `LeakTests.test_system_namespaces_preserved` | `local.oplog.rs` kept | pass |
+| 16 | `LeakTests.test_parity_default` | x-pattern and fruit styles change exactly the same tokens | pass |
+| 17 | `LeakTests.test_parity_redact_namespaces` | ... with `--redactNamespaces` | pass |
+| 18 | `LeakTests.test_char_fields_selective_keeps_coverage` | `--char_fields` keeps full coverage | pass |
+| 19 | `LeakTests.test_legacy_text_log_both_styles` | pre-4.4 text log: no leaks, structure kept | pass |
+| 20 | `LeakTests.test_benign_fields_not_corrupted` | `mechanism`, `msg` are not rewritten by learned names; oplog entry keys kept, `op` masked like the server | pass |
+| 21 | `LeakTests.test_renamed_keys_never_collide_or_drop_fields` | field count preserved in both styles (fails without the fix) | pass |
+| 22 | `LeakTests.test_addfields_still_works` | `--addFields grId` removes a custom field | pass |
+| 23 | `LeakTests.test_seed_gives_the_same_words_across_files_order_and_options` | same seed -> same word for the same name in another file, another order, other options; another seed -> other word | pass |
+| 24 | `ServerPolicyTests.test_s1_bindata_6_and_8_masked_in_every_context` | BinData 6/8 masked in a generic attr, a filter, a CRUD `o`, nested arrays and JSON embedded in a string | pass |
+| 25 | `ServerPolicyTests.test_s1_mask_is_the_server_mask_and_replaces_the_whole_element` | the whole `{"$binary": ..}` becomes the string `"###"` (both styles) | pass |
+| 26 | `ServerPolicyTests.test_s1_other_subtypes_and_sibling_values_untouched` | like the server's `RedactSensitiveStringTest`: subtypes 0 / 4 and sibling strings stay | pass |
+| 27 | `ServerPolicyTests.test_s1_legacy_extended_json_form` | `{"$binary": "..", "$type": "08"}` | pass |
+| 28 | `ServerPolicyTests.test_s2_payload_documents_erase_bool_null_and_flag_ints` | bool / null / 0 / 1 / -1 / float / string in `documents` all erased | pass |
+| 29 | `ServerPolicyTests.test_default_keeps_keys_and_operators_but_masks_every_literal` | `$project` / `$sort` / `$group` keep stage names, operators and keys; every literal incl. flags and null is `###` | pass |
+| 30 | `ServerPolicyTests.test_default_masks_update_options_like_the_server` | `multi` / `upsert` / `ordered` are `###` like the server | pass |
+| 31 | `ServerPolicyTests.test_default_builtin_pii_ref_inside_operand_array` | `{"$in": [<value>, ["$email"]]}` redacts the literal | pass |
+| 32 | `ServerPolicyTests.test_idempotent_on_server_redacted_logs_every_mode` | a server-redacted entry (`###`, `Unauthorized: ###`, `InternalError ###`) is unchanged in 4 option sets | pass |
+| 33 | `ServerPolicyTests.test_server_redaction_matches_server_unit_tests` | the cases of the server's own `redaction_test.cpp` plus the `{$regex, $options}` operator document | pass |
+| 34 | `ServerPolicyTests.test_server_redaction_matches_reference_model` | 6 realistic commands == independent model of `BSONObj::redact(all)` | pass |
+| 35 | `ServerPolicyTests.test_server_redaction_schema_keys_are_still_obfuscated` | documented deviation: `sort` / `hint` / `projection` keys are aliased, values `###` | pass |
+| 36 | `ServerPolicyTests.test_server_redaction_other_data_attrs_and_oplog_entry` | oplog entry (`bgsync.cpp` `lastOplogEntry`), `keyValue`, `errInfo` | pass |
+| 37 | `ServerPolicyTests.test_server_redaction_status_exception_and_what_forms` | `CodeName: ###`, `Code{extra}: ..` -> `Code: ###`, `OK`, plain `what()` -> `###` | pass |
+| 38 | `ServerPolicyTests.test_server_redaction_structured_status_keeps_code_drops_reason` | `{code, codeName, errmsg}` -> `errmsg: "###"` | pass |
+| 39 | `ServerPolicyTests.test_server_redaction_mask_ignores_char_replacement_and_keeps_other_rules` | `###` in both styles; ns / appName / IP / email still redacted | pass |
+| 40 | `ServerPolicyTests.test_server_redaction_canary_corpus_both_styles` | full synthetic corpus: 0 leaks in both styles | pass |
+| 41 | `ServerPolicyTests.test_log_only_options_rejected_for_ftdc` | log-only options rejected in `--ftdc_redact` | pass |
+| 42 | `SchemaFileTests.test_rule_matrix` | **the rule**: none / schema / addFields / schema+addFields x fruit / x: requested fields are gone, un-requested stay, built-in PII always gone | pass |
+| 43 | `SchemaFileTests.test_client_data_is_always_masked_whatever_the_options` | inside a command every literal is `###` and the result is identical under all 4 combinations x 2 styles | pass |
+| 44 | `SchemaFileTests.test_path_precision_vendor_not_redacted_by_customer_path` | path `customer.vipCode` redacts customer only, `vendor.vipCode` stays in 6 contexts | pass |
+| 45 | `SchemaFileTests.test_path_is_contiguous_bare_name_matches_any_depth` | `customer.items.$[e].vipCode` is another path; a bare `vipCode` matches at any depth | pass |
+| 46 | `SchemaFileTests.test_path_in_aggregation_field_reference_and_free_text` | `$eq` / `$in` against `$customer.vipCode`, and `customer.vipCode: <v>` in free text | pass |
+| 47 | `SchemaFileTests.test_flat_names_and_builtin_pii_in_comparisons_outside_client_data` | `{"$eq": ["$grId", <v>]}` / `{"$in": [<v>, ["$grId"]]}` / `$email` in a non-data container | pass |
+| 48 | `SchemaFileTests.test_flat_schema_field_matches_like_add_fields_everywhere` | `$in` operand, `$set`, comparison refs, sub-document, JSON string, free text | pass |
+| 49 | `SchemaFileTests.test_style_fruit_vs_x_for_schema_values` | fruit words vs `x-xxxx` pattern | pass |
+| 50 | `SchemaFileTests.test_union_equals_add_fields_with_the_same_names` | schema fields + `--addFields` == one `--addFields` with both lists (byte-identical with a seed) | pass |
+| 51 | `SchemaFileTests.test_deterministic_with_seed` | same seed -> same output | pass |
+| 52 | `SchemaFileTests.test_works_with_redact_namespaces_and_seed` | combines with `--redactNamespaces --seed` | pass |
+| 53 | `SchemaFileTests.test_file_formats` | array shorthand, bare nested, fields-only, paths-only, one-segment path, `false` leaf, meta keys | pass |
+| 54 | `SchemaFileTests.test_case_insensitive_dollar_optional_and_dotted_match` | `$TENANTREF`, `GrId`, `Customer.VIPCODE` | pass |
+| 55 | `SchemaFileTests.test_empty_schema_is_a_noop` | `{}`, `[]`, `{"fields": []}`, `{"paths": []}` change nothing | pass |
+| 56 | `SchemaFileTests.test_legacy_text_log` | the four combinations on a pre-4.4 text log | pass |
+| 57 | `SchemaFileTests.test_rejects_missing_file` | exit 2, one-line error | pass |
+| 58 | `SchemaFileTests.test_rejects_invalid_json` | exit 2, no traceback | pass |
+| 59 | `SchemaFileTests.test_rejects_wrong_types` | nine malformed shapes rejected | pass |
+| 60 | `SchemaFileTests.test_rejects_binary_garbage` | non-UTF-8 file rejected cleanly | pass |
+| 61 | `SchemaFileTests.test_rejected_for_ftdc` | log-only option rejected with `--ftdc_redact` | pass |
+| 62 | `SchemaFileTests.test_schema_file_content_never_echoed_on_error` | a field name in a broken file never appears in stderr | pass |
 
-The parity test was checked with a deliberate mutation (x-mode skipping host
-redaction): three tests failed, so it detects coverage drift. The server-policy
-tests S1 / S2 / idempotence were run against the implementation *before* the
-change: all six failed there and pass now.
+Mutation checks: the parity test detects a style that skips host redaction (3 tests failed); the server-policy
+tests failed against the implementation *before* the change and pass now.
 
 ---
 
@@ -166,74 +169,66 @@ change: all six failed there and pass now.
 
 `test_integration_mongo.py <version>`:
 
-1. `m` resolves `X.Y` to the newest patch installable on this platform and
-   installs it; the active `m` version is restored (symlinks re-created and
-   verified identical afterwards).
-2. `mlaunch` starts a minimal **auth-enabled sharded cluster**: 1 shard
-   (single-node replica set) + 1 config server + 1 mongos, `slowms=0`.
-3. A PII-heavy workload runs through the mongos: CRUD, aggregation
-   (`$lookup`, `$out`, `$unionWith`), bad-modifier and validation errors,
-   transactions, change streams + resume, index builds, `shardCollection` /
-   `split` (`moveChunk` with `--shards 2`), users, failed and successful
-   logins, several `appName`s, direct shard connections.
-4. The three real logs (mongos, shard mongod, config mongod) are redacted under
-   a flag matrix and checked. The cluster is stopped and processes verified gone.
-5. With `--ground-truth` and an enterprise build (`5.0.31-ent`), a **second,
-   identical cluster** runs the same workload with the server redacting its own
-   logs (`redactClientLogData=true`); its output is the reference for
-   `--server_redaction` (section 3c).
+1. `m` resolves `X.Y` to the newest patch installable on this platform and installs it; the active `m` version is
+   restored (symlinks re-created and verified identical afterwards).
+2. `mlaunch` starts a minimal **auth-enabled sharded cluster**: 1 shard (single-node replica set) + 1 config server +
+   1 mongos, `slowms=0`.
+3. A PII-heavy workload runs through the mongos: CRUD, aggregation (`$lookup`, `$out`, `$unionWith`), bad-modifier and
+   validation errors, transactions, change streams + resume, index builds, `shardCollection` / `split` (`moveChunk`
+   with `--shards 2`), users, failed and successful logins, BinData 6/8 payloads, schema-targeted fields, several
+   `appName`s, direct shard connections.
+4. The three real logs (mongos, shard mongod, config mongod) are redacted under an option matrix and checked. The
+   cluster is stopped and processes verified gone.
+5. With `--ground-truth` and an enterprise build (`5.0.31-ent`), a **second, identical cluster** runs the same
+   workload with the server redacting its own logs (`redactClientLogData=true`); its output is the reference for the
+   default policy (section 3c).
 
 ### Results per version (community builds)
 
-| Version | Resolved from | Log lines (config / mongos / shard) | Canaries in source logs | BinData 6/8 base64 in the *source* log | Server errors in workload (expected) | Tests | Time |
-|---------|---------------|-------------------------------------|:------:|:------:|:--:|:------:|-----:|
-| 4.4.29 | `4.4` (4.4.30/.31 have no macOS build) | 493 / 304 / 543 | 62 / 63 | **yes** | 8 | 32 / 32 (+4 skipped) | 74 s |
-| 5.0.31 | `5.0` (5.0.32-.34 have no macOS build) | 543 / 558 / 834 | 62 / 63 | **yes** | 7 | 32 / 32 (+4 skipped) | 134 s |
-| 6.0.29 | `6.0` | 605 / 554 / 923 | 62 / 63 | no (server masks) | 7 | 32 / 32 (+4 skipped) | 120 s |
-| 7.0.43 | `7.0` | 775 / 694 / 1109 | 62 / 63 | no (server masks) | 7 | 32 / 32 (+4 skipped) | 119 s |
-| 8.0.32 | `8.0` | 917 / 621 / 1394 | 62 / 63 | no (server masks) | 7 | 32 / 32 (+4 skipped) | 140 s |
+| Version | Resolved from | Log lines (config / mongos / shard) | Canaries in source logs | BinData 6/8 base64 in the *source* log | System ns attrs / loopback remotes kept | Tests | Time |
+|---------|---------------|-------------------------------------|:------:|:------:|:------:|:------:|-----:|
+| 4.4.29 | `4.4` (4.4.30/.31 have no macOS build) | 490 / 300 / 541 | 62 / 63 | **yes** | 294 / 314 | 28 / 28 (+4 skipped) | 67 s |
+| 5.0.31 | `5.0` (5.0.32-.34 have no macOS build) | 539 / 560 / 835 | 62 / 63 | **yes** | 499 / 740 | 28 / 28 (+4 skipped) | 124 s |
+| 6.0.29 | `6.0` | 594 / 560 / 928 | 62 / 63 | no (server masks) | 583 / 771 | 28 / 28 (+4 skipped) | 111 s |
+| 7.0.43 | `7.0` | 794 / 705 / 1110 | 62 / 63 | no (server masks) | 630 / 743 | 28 / 28 (+4 skipped) | 112 s |
+| 8.0.32 | `8.0` | 919 / 621 / 1395 | 62 / 63 | no (server masks) | 862 / 852 | 28 / 28 (+4 skipped) | 127 s |
 
-The one canary never logged by any version is the admin password
-(`Secr3tPassw0rd`): the server does not write it, which is the correct outcome.
-After every run: 0 stray server processes, `m` symlinks identical to the
-snapshot taken before any install.
+The one canary never logged by any version is the admin password (`Secr3tPassw0rd`): the server does not write it,
+which is the correct outcome. After every run: 0 stray server processes, `m` symlinks identical to the snapshot taken
+before any install.
 
-### The 32 tests (identical result on all five versions)
+### The 28 tests (identical result on all five versions)
 
 | # | Test | What it proves | 4.4 | 5.0 | 6.0 | 7.0 | 8.0 |
 |--:|------|----------------|:--:|:--:|:--:|:--:|:--:|
 | 1 | `test_00_cluster_and_source_logs` | cluster started, logs are logv2 JSON | pass | pass | pass | pass | pass |
-| 2 | `test_01_canaries_actually_reach_the_logs` | the fake PII really reached the logs (test is not vacuous) | pass | pass | pass | pass | pass |
-| 3 | `test_10_matrix_default` | no canary / source IP / hostname / OS user; valid logv2; `t,s,c,id` and top-level attr keys unchanged | pass | pass | pass | pass | pass |
-| 4 | `test_11_matrix_pii` | same, `--pii` | pass | pass | pass | pass | pass |
-| 5 | `test_12_matrix_pii_seed` | same, `--pii --seed` | pass | pass | pass | pass | pass |
-| 6 | `test_13_matrix_pii_redactns` | same, `--pii --redactNamespaces` | pass | pass | pass | pass | pass |
-| 7 | `test_14_matrix_pii_x` | same, `--pii --char_replacement` | pass | pass | pass | pass | pass |
-| 8 | `test_15_matrix_everything` | same, every option combined incl. `--addFields` | pass | pass | pass | pass | pass |
-| 9 | `test_16_matrix_strict` | same, `--strict` (also unlisted fields) | pass | pass | pass | pass | pass |
-| 10 | `test_17_matrix_strict_x_redactns` | same, `--strict --char_replacement --redactNamespaces` | pass | pass | pass | pass | pass |
-| 11 | `test_18_matrix_single_pass` | `--single_pass` (names exempt by design, PII values not) | pass | pass | pass | pass | pass |
-| 12 | `test_18b_matrix_server_redaction` | same leak matrix with `--server_redaction` | pass | pass | pass | pass | pass |
-| 13 | `test_18c_matrix_server_redaction_x` | `--server_redaction --char_replacement --redactNamespaces --seed` | pass | pass | pass | pass | pass |
-| 14 | `test_19_addfields_removes_custom_field_in_filters` | `--addFields grId` removes a custom field | pass | pass | pass | pass | pass |
-| 15 | `test_20_strict_removes_unlisted_values` | `--strict` removes unlisted filter values; plain `--pii` keeps them (documented) | pass | pass | pass | pass | pass |
-| 16 | `test_30_shape_scan_x_mode` | independent scan of every string: no email / SSN / Luhn card / JWT / raw IP shape in x mode | pass | pass | pass | pass | pass |
-| 17 | `test_31_shape_scan_word_mode` | word mode: only `fruit@colour.com` emails, no SSN / JWT | pass | pass | pass | pass | pass |
-| 18 | `test_40_parity_default` | fruit vs x style change exactly the same tokens (real logs) | pass | pass | pass | pass | pass |
-| 19 | `test_41_parity_pii` | ... with `--pii` | pass | pass | pass | pass | pass |
-| 20 | `test_42_parity_strict_redactns` | ... with `--strict --redactNamespaces` | pass | pass | pass | pass | pass |
-| 21 | `test_50_redacted_logs_remain_parseable` | every line validates against logv2 (mtools 1.7.2 cannot parse 4.4+ JSON logs, so the built-in validator is used) | pass | pass | pass | pass | pass |
-| 22 | `test_51_operational_metrics_preserved` | durations / counters kept; `(c, id, msg)` histogram identical | pass | pass | pass | pass | pass |
-| 23 | `test_52_system_namespaces_and_loopback_kept` | `config.*`, `admin.$cmd`, 127.0.0.1 kept; `config.cache.chunks.<user ns>` redacted | pass | pass | pass | pass | pass |
-| 24 | `test_53_bindata_6_and_8_masked_by_default_in_every_mode` | BinData 6/8 base64 (which the 4.4 / 5.0 servers print) absent in 5 flag sets | pass | pass | pass | pass | pass |
-| 25 | `test_54_server_redaction_equals_reference_model_on_real_logs` | every real `command` / `originatingCommand` == the model of `BSONObj::redact(all)` | pass | pass | pass | pass | pass |
-| 26 | `test_55_server_redaction_status_forms_and_fixpoint` | every status attr is `CodeName: ###` / `###` / `{errmsg:###}`; second pass is a fixpoint on client data | pass | pass | pass | pass | pass |
-| 27 | `test_56_schema_file_and_add_fields_combinations` | the four option combinations x fruit / x x `--pii` (+ `--redactNamespaces --seed`) on the real mongos / shard / config logs: requested canaries gone, un-requested stay, built-in PII gone | pass | pass | pass | pass | pass |
-| 28 | `test_57_schema_file_with_strict_and_server_redaction_is_additive` | schema + `--addFields` on top of `--strict` / `--server_redaction` | pass | pass | pass | pass | pass |
-| 29 | `test_60_seed_determinism_and_salting` | same seed -> same output; unseeded tokens differ per run | pass | pass | pass | pass | pass |
-| 30 | `test_61_no_unsalted_md5_of_sensitive_values` | no MD5 of any canary / name appears | pass | pass | pass | pass | pass |
-| 31 | `test_62_idempotent_and_still_json_on_second_pass` | redacting the redacted log works and stays JSON | pass | pass | pass | pass | pass |
-| 32 | `test_63_damaged_real_log_fails_closed_and_stays_json` | blank first line, truncated and syslog-prefixed lines: still JSON, no leak | pass | pass | pass | pass | pass |
+| 2 | `test_01_canaries_actually_reach_the_logs` | the fake PII really reached the logs (the suite is not vacuous) | pass | pass | pass | pass | pass |
+| 3 | `test_10_matrix_default` | no canary / source IP / hostname / OS user / unlisted-field value; valid logv2; `t,s,c,id` and top-level attr keys unchanged | pass | pass | pass | pass | pass |
+| 4 | `test_11_matrix_seed` | same, `--seed` | pass | pass | pass | pass | pass |
+| 5 | `test_12_matrix_redactns` | same, `--redactNamespaces` | pass | pass | pass | pass | pass |
+| 6 | `test_13_matrix_x` | same, `--char_replacement` | pass | pass | pass | pass | pass |
+| 7 | `test_14_matrix_everything` | same, seed + x + redactNamespaces + `--addFields` | pass | pass | pass | pass | pass |
+| 8 | `test_15_matrix_x_redactns_seed` | same, x + redactNamespaces + seed | pass | pass | pass | pass | pass |
+| 9 | `test_16_matrix_single_pass` | `--single_pass` (names exempt by design, PII values not) | pass | pass | pass | pass | pass |
+| 10 | `test_19_addfields_removes_custom_field` | `--addFields grId` removes the custom field everywhere | pass | pass | pass | pass | pass |
+| 11 | `test_20_default_removes_values_of_unlisted_fields` | values of field names the tool has never heard of are removed by the DEFAULT policy | pass | pass | pass | pass | pass |
+| 12 | `test_21_deprecated_flags_are_accepted_and_ignored` | `--pii` / `--strict` / `--server_redaction` / `--redactClientLogData`: identical output, one stderr note | pass | pass | pass | pass | pass |
+| 13 | `test_30_shape_scan_x_mode` | independent scan of every string: no email / SSN / Luhn card / JWT / raw IP shape in x mode | pass | pass | pass | pass | pass |
+| 14 | `test_31_shape_scan_word_mode` | word mode: only `fruit@colour.com` emails, no SSN / JWT | pass | pass | pass | pass | pass |
+| 15 | `test_40_parity_default` | fruit vs x style change exactly the same tokens (real logs) | pass | pass | pass | pass | pass |
+| 16 | `test_41_parity_redactns` | ... with `--redactNamespaces` | pass | pass | pass | pass | pass |
+| 17 | `test_50_redacted_logs_remain_parseable` | every line validates against logv2 (mtools 1.7.2 cannot parse 4.4+ JSON logs, so the built-in validator is used) | pass | pass | pass | pass | pass |
+| 18 | `test_51_operational_metrics_preserved` | durations / counters kept; `(c, id, msg)` histogram identical | pass | pass | pass | pass | pass |
+| 19 | `test_52_system_namespaces_and_loopback_kept` | `ns` / `namespace` attributes of `config.*`, `local.*`, `admin.*` kept line by line (hundreds), 127.0.0.1 kept; `config.cache.chunks.<user ns>` redacted | pass | pass | pass | pass | pass |
+| 20 | `test_53_bindata_6_and_8_masked_by_default_in_every_mode` | BinData 6/8 base64 (which the 4.4 / 5.0 servers print) absent in 4 option sets | pass | pass | pass | pass | pass |
+| 21 | `test_54_default_equals_server_reference_model_on_real_logs` | every real `command` / `originatingCommand` == the model of `BSONObj::redact(all)` | pass | pass | pass | pass | pass |
+| 22 | `test_55_default_status_forms_and_fixpoint` | every status attr is `CodeName: ###` / `###` / `{errmsg:###}`; a second pass is a fixpoint on client data | pass | pass | pass | pass | pass |
+| 23 | `test_56_schema_file_and_add_fields_combinations` | the 4 combinations x 2 styles x 2 option sets on a real log + an injected non-client-data probe: requested fields gone, un-requested stay; real client data masked in every combination | pass | pass | pass | pass | pass |
+| 24 | `test_57_schema_file_with_addfields_is_additive_and_deterministic` | same seed -> same output; real lines unchanged, only the probe gains redactions | pass | pass | pass | pass | pass |
+| 25 | `test_60_seed_determinism_and_salting` | same seed -> same output; unseeded tokens differ per run | pass | pass | pass | pass | pass |
+| 26 | `test_61_no_unsalted_md5_of_sensitive_values` | no MD5 of any canary / name appears | pass | pass | pass | pass | pass |
+| 27 | `test_62_idempotent_and_still_json_on_second_pass` | redacting the redacted log works and stays JSON | pass | pass | pass | pass | pass |
+| 28 | `test_63_damaged_real_log_fails_closed_and_stays_json` | blank first line, truncated and syslog-prefixed lines: still JSON, no leak | pass | pass | pass | pass | pass |
 
 ---
 
@@ -247,30 +242,31 @@ calls `logv2/redaction.h`, `logv2/logv2_options.{idl,cpp}`, `bson/bsonobj.cpp`
 
 | # | Server policy | Source | Covered before | Now |
 |---|---------------|--------|----------------|-----|
-| S0 | Mask is the constant `"###"`; field names and structure are kept | `redaction.cpp` `kRedactionDefaultMask` | different mask (fruit / x) | `###` in `--server_redaction`; names / x-pattern elsewhere |
-| S1 | BinData subtype **6 (Encrypt)** and **8 (Sensitive)** -> `"###"` at any depth, even with `redactClientLogData` off (`redactBinDataEncrypt` defaults to **true**; subtype 8 unconditionally) | `log_util.cpp`, `bsonobj.cpp` `encryptedAndSensitive` / `sensitiveOnly` | **No** (base64 leaked in filters / generic attrs) | **Always on**, every mode, every context, both EJSON forms |
-| S2 | `redactClientLogData=true` -> BSON level `all`: every scalar of ANY type (string, number, bool, null, date, oid, bindata) -> `"###"`; arrays walked | `redaction.cpp`, `log_redact_options.cpp`, `bsonobj.cpp` `RedactLevel::all` | partly (bool / null / `0,1,-1` survived in payloads and under PII keys) | type erasure always on for payload documents and PII-key booleans; **`--server_redaction`** = exact level `all` |
-| S3 | `redact(Status)` -> `CodeName: ###` (`OK` stays), `redact(DBException)` -> `CodeName ###`, `redact(e.what())` -> `###` | `redaction.cpp`, `bgsync.cpp` lines 232 / 237 / 541 / 592 / 686 / 922 | reason text kept (heuristic masking) | `--server_redaction` reproduces the forms |
+| S0 | Mask is the constant `"###"`; field names and structure are kept | `redaction.cpp` `kRedactionDefaultMask` | different mask (fruit / x) | `###` for all client data; fruit / x-pattern for names, hosts, users, apps |
+| S1 | BinData subtype **6 (Encrypt)** and **8 (Sensitive)** -> `"###"` at any depth, even with `redactClientLogData` off (`redactBinDataEncrypt` defaults to **true**; subtype 8 unconditionally) | `log_util.cpp`, `bsonobj.cpp` `encryptedAndSensitive` / `sensitiveOnly` | **No** (base64 leaked in filters / generic attrs) | **Default**, every context, both EJSON forms |
+| S2 | `redactClientLogData=true` -> BSON level `all`: every scalar of ANY type (string, number, bool, null, date, oid, bindata) -> `"###"`; arrays walked | `redaction.cpp`, `log_redact_options.cpp`, `bsonobj.cpp` `RedactLevel::all` | partly (bool / null / `0,1,-1` survived in payloads and under PII keys) | **default**: exact level `all` for all client data |
+| S3 | `redact(Status)` -> `CodeName: ###` (`OK` stays), `redact(DBException)` -> `CodeName ###`, `redact(e.what())` -> `###` | `redaction.cpp`, `bgsync.cpp` lines 232 / 237 / 541 / 592 / 686 / 922 | reason text kept (heuristic masking) | **default** reproduces the forms |
 | S4 | Scope: only call sites wrapped in `redact()` (errors, exception text, BSON docs such as `lastOplogEntry`); hosts, namespaces, `syncSource` and five other `error` attrs in the same file are not | `bgsync.cpp` | we were already stricter | unchanged: every other rule of this tool still applies on top |
-| S5 | Logs already redacted by the server must survive a second pass | - | **No** (`find: "###"` -> `"loquat"`) | idempotent on `###`, `CodeName: ###`, `CodeName ###`, `OK` |
+| S5 | Logs already redacted by the server must survive a second pass | - | **No** (`find: "###"` -> `"loquat"`) | **default**: idempotent on `###`, `CodeName: ###`, `CodeName ###`, `OK` |
 
-Deliberate deviations (documented in the README): the keys of `sort` / `hint` /
-`projection` / `fields` (index and field names, which the server leaves visible)
-are always obfuscated; `-1 / 0 / 1` and booleans are kept under `$project` / `$sort` /
-`$group` / update options in non-payload queries.
+Deliberate deviation (documented in the README): the keys of `sort` / `hint` / `projection` /
+`fields` (index and field names, which the server leaves visible) are always obfuscated.
 
-Examples (`--pii`, word style unless noted; real outputs of the final script):
+Since these policies became the **default**, `--pii`, `--strict`, `--server_redaction` and
+`--redactClientLogData` are accepted and ignored (hidden from `--help`, one stderr note).
+
+Examples (default policy, word style unless noted; real outputs of the final script):
 
 | Policy | Input | Output |
 |--------|-------|--------|
 | S1 | `{"a": {"$binary": {"base64": "Y2lwaGVy...", "subType": "06"}}, "b": {... "subType": "08"}, "c": {... "subType": "00"}}` | `{"a": "###", "b": "###", "c": {"$binary": {... "subType": "00"}}}` (subtype 0 kept) |
 | S2 | payload `{"optedOut": false, "hivStatus": true, "n": null}` | `{"optedOut": "###", "hivStatus": "###", "n": "###"}` |
-| S2 | `$project: {"email": 1, "phone": true}`, `$sort: {"createdAt": -1}` | unchanged (structure) |
-| S2 `--server_redaction` | `{"find":"c","filter":{"email":"a@b.com","age":{"$gt":18},"tags":["a","b"],"_id":{"$oid":"6ac6..."}},"$db":"acmeshopdb"}` | `{"find":"###","filter":{"email":"###","age":{"$gt":"###"},"tags":["###","###"],"_id":"###"},"$db":"###"}` |
-| S3 `--server_redaction` | `Unauthorized: not authorized on acmeshopdb to execute command { find: "c" }` | `Unauthorized: ###` |
-| S3 `--server_redaction` | `ShutdownInProgress{ remainingQuiesceTimeMillis: 0 }: Replication is being shut down; ...` | `ShutdownInProgress: ###` |
-| S3 `--server_redaction` | `{"code":13,"codeName":"Unauthorized","errmsg":"not authorized on ..."}` | `{"code":13,"codeName":"Unauthorized","errmsg":"###"}` |
-| S5 | `{"command":{"find":"###","filter":{"a":"###"}},"error":"Unauthorized: ###"}` | identical, in all 7 flag sets tested |
+| S2 | `$project: {"email": 1, "phone": true}`, `$sort: {"createdAt": -1}` | `{"email": "###", "phone": "###"}`, `{"createdAt": "###"}` (operators and keys kept) |
+| S2 | `{"find":"c","filter":{"email":"a@b.com","age":{"$gt":18},"tags":["a","b"],"_id":{"$oid":"6ac6..."}},"$db":"acmeshopdb"}` | `{"find":"###","filter":{"email":"###","age":{"$gt":"###"},"tags":["###","###"],"_id":"###"},"$db":"###"}` |
+| S3 | `Unauthorized: not authorized on acmeshopdb to execute command { find: "c" }` | `Unauthorized: ###` |
+| S3 | `ShutdownInProgress{ remainingQuiesceTimeMillis: 0 }: Replication is being shut down; ...` | `ShutdownInProgress: ###` |
+| S3 | `{"code":13,"codeName":"Unauthorized","errmsg":"not authorized on ..."}` | `{"code":13,"codeName":"Unauthorized","errmsg":"###"}` |
+| S5 | `{"command":{"find":"###","filter":{"a":"###"}},"error":"Unauthorized: ###"}` | identical |
 
 **The server masks BinData 6/8 only from 6.0 on.** Measured on the real servers of
 this suite (`test_53`): the base64 of both payloads is present in the 4.4.29 and
@@ -282,8 +278,8 @@ source version.
 
 `--ground-truth` runs a second, identical cluster on an **enterprise** build with
 `setParameter redactClientLogData=true` on the mongos, the shard and the config
-server, and compares the server's own redacted logs with `--server_redaction` applied
-to the unredacted logs of the first cluster.
+server, and compares the server's own redacted logs with the **default output** of the
+tool for the unredacted logs of the first cluster (no flags).
 
 | Test | What it proves |
 |------|----------------|
@@ -294,9 +290,9 @@ to the unredacted logs of the first cluster.
 
 | Enterprise build | Tests | Distinct server-redacted commands identical to ours (config / mongos / shard) | Status attrs compared | server masked and we match | server left the reason **in clear** (we mask) |
 |------------------|:-----:|-----------------------------------------------|:--:|:--:|:--:|
-| 5.0.31-ent | 36 / 36 | 26 / 67 / 77 (44 / 98 / 88 log lines) | 38 | 11 | 27 |
-| 7.0.17-ent | 36 / 36 | 18 / 67 / 78 (34 / 98 / 89 log lines) | 40 | 11 | 29 |
-| 8.0.17-ent | 36 / 36 | 18 / 67 / 81 (39 / 98 / 95 log lines) | 42 | 12 | 30 |
+| 5.0.31-ent | 32 / 32 | 26 / 67 / 77 (43 / 98 / 89 log lines) | 39 | 11 | 28 |
+| 7.0.17-ent | 32 / 32 | 18 / 67 / 78 (33 / 98 / 89 log lines) | 40 | 11 | 29 |
+| 8.0.17-ent | 32 / 32 | 18 / 67 / 81 (38 / 98 / 95 log lines) | 42 | 12 | 30 |
 
 What the real servers showed (and the tests now encode):
 
@@ -324,9 +320,11 @@ What the real servers showed (and the tests now encode):
 
 Rule under test: **none -> default; `--loadSchemaFile` -> default + schema; `--addFields` -> default + fields;
 both -> default + schema + fields.** Fixture (`SCHEMA_DOC`): `fields: [tenantRef]`, `paths: [customer.vipCode]`,
-`schema: {loyalty: {tier: true}}`; `--addFields grId`. Five canaries: built-in PII (`email`), `grId` (only
-`--addFields`), `tenantRef` / `customer.vipCode` / `loyalty.tier` (only the schema file), plus two that must
-**stay visible**: `vendor.vipCode` (a different path) and `customer.items.$[e].vipCode` (not contiguous).
+`schema: {loyalty: {tier: true}}`; `--addFields grId`. Inside client data (commands, filters, documents, oplog
+entries) the default policy already masks every literal with `###`, so the combinations are observed in containers that
+are **not** client data. Seven canaries: built-in PII (`email`), `grId` (only `--addFields`), `tenantRef` /
+`customer.vipCode` / `loyalty.tier` (only the schema file), plus two that must **stay visible**: `vendor.vipCode`
+(a different path) and `customer.items.$[e].vipCode` (not contiguous).
 
 | Options | email (default) | grId | tenantRef | customer.vipCode | loyalty.tier | vendor.vipCode |
 |---------|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -335,25 +333,27 @@ both -> default + schema + fields.** Fixture (`SCHEMA_DOC`): `fields: [tenantRef
 | `--addFields grId` | gone | gone | **visible** | **visible** | **visible** | visible |
 | both | gone | gone | gone | gone | gone | visible |
 
-The table is asserted (not only documented) for fruit and x style, in `--pii` and `--strict` mode on a nine-context
-corpus (generic attr, filter with dotted keys, `$in` operand, `$elemMatch`, array of sub-documents, `$set` on dotted /
-positional paths, `$expr` field references, oplog `o`, JSON serialised in a string, free text), and again on the
-real mongos / shard / config logs of every version (`test_56`: 4 combinations x 2 styles x 2 modes; `test_57`: on top
-of `--strict` and `--server_redaction`). Result: **all pass** on 4.4, 5.0, 6.0, 7.0, 8.0 and on the three enterprise builds.
+The table is asserted for fruit and x style on a nine-context corpus (generic attr, query-shaped container with dotted
+keys and `$in` operands, `$elemMatch`, arrays of sub-documents, `$set` on dotted / positional paths, comparisons
+against field references, sub-document, JSON serialised in a string, free text). The same four combinations applied to
+a **command** give one identical result (every literal `###`), asserted by
+`test_client_data_is_always_masked_whatever_the_options`. On the real servers (`test_56`, `test_57`) a real log plus one
+injected non-client-data entry gives the same table, and the real client data of all three logs is masked in every
+combination. Result: **all pass** on 4.4, 5.0, 6.0, 7.0, 8.0 and on the three enterprise builds.
 
-Breaches found while writing the tests (all fixed, see section 1, #28-#31): dotted schema paths were not applied to
-`$eq` / `$in` comparisons against `"$customer.vipCode"` nor to free text, and field references inside an operand
-array were missed, for schema paths and also for the built-in PII keys (`{"$in": [<value>, ["$email"]]}`).
+Examples (`--seed s`; one line whose attributes are not client data; schema = `fields: [tenantRef]`,
+`paths: [customer.vipCode]`):
 
-Examples (same input line, `--pii --seed s`):
+| Options | `attr` |
+|---------|--------|
+| none | `{"emails":["damson","date"],"tenantRef":"T-77","customer":{"vipCode":"VIP-9"},"vendor":{"vipCode":"V-5"}}` |
+| `--loadSchemaFile` | `{"emails":["damson","date"],"tenantRef":"olive","customer":{"vipCode":"tamarillo"},"vendor":{"vipCode":"V-5"}}` |
+| `--loadSchemaFile --char_replacement` | `{"emails":["xxxxx@xxxxxxxxxxxx.xxx","xxxxx@xxxxxxxxxxxx.xxx"],"tenantRef":"x-xx","customer":{"vipCode":"xxx-x"},"vendor":{"vipCode":"V-5"}}` |
 
-| Options | `filter` |
-|---------|----------|
-| none | `{"email": "ugli.fruit@aliceblue.com", "grId": "G-1001", "tenantRef": "T-77", "customer.vipCode": "VIP-9", "vendor.vipCode": "V-5", "loyalty": {"tier": "gold"}}` |
-| `--loadSchemaFile` | `{"email": "coconut@palegreen.com", "grId": "G-1001", "tenantRef": "melon", "customer.vipCode": "apple", "vendor.vipCode": "V-5", "loyalty": {"tier": "ugli.fruit"}}` |
-| `--addFields grId` | `{"email": "ugli.fruit@aliceblue.com", "grId": "coconut", "tenantRef": "T-77", "customer.vipCode": "VIP-9", "vendor.vipCode": "V-5", "loyalty": {"tier": "gold"}}` |
-| both | `{"email": "coconut@palegreen.com", "grId": "melon", "tenantRef": "physalis", "customer.vipCode": "apple", "vendor.vipCode": "V-5", "loyalty": {"tier": "ugli.fruit"}}` |
-| both, `--char_replacement` | `{"email": "xxxxx@xxxx.xxx", "grId": "x-xxxx", "tenantRef": "x-xx", "customer.vipCode": "xxx-x", "vendor.vipCode": "V-5", "loyalty": {"tier": "xxxx"}}` |
+Breaches found while writing these tests (all fixed, section 1): dotted schema paths were not applied to `$eq` / `$in`
+comparisons against `"$customer.vipCode"` nor to free text; field references inside an operand array were missed;
+and comparisons against an `--addFields` field or a built-in PII key (`{"$eq": ["$grId", "x"]}`,
+`{"$eq": ["$email", "x"]}`) in a non-client-data container left the literal in clear.
 
 Validation (exit code 2, one line, no traceback, content never echoed): missing file, invalid JSON, `"fields": "grId"`,
 empty names, `"paths": ["a.b", 5]`, `"paths": ["..."]`, `"schema": {"a": 5}`, `"schema": ["a"]`, a JSON string / number
@@ -363,64 +363,54 @@ at top level, binary garbage; rejected together with `--ftdc_redact`.
 
 ## 4. One real line per test, before and after (MongoDB 5.0.31, x replacement)
 
-Each row is a real log line redacted with `--char_replacement` plus the flags of
-that test. Only relevant fields are shown; `...` marks shortened values.
+Real lines from the 5.0.31 cluster, redacted with `--char_replacement` plus the options of that test (the
+default policy is always on). Only relevant fields are shown; `...` marks shortened values.
 
-| Test | Flags (+ `--char_replacement`) | Before | After |
-|------|-------------------------------|--------|-------|
-| 00 | default | `keyFile: "/tmp/ofuscator_it_XXXX/cluster/keyfile"`, `configDB: "configRepl/localhost:27702"` | `"/xxx/xxxxxxx/x_/xxxxxxxx.../xxxxxxx"`, `"xxxxxxxxxx/xxxxxxxxx:xxxxx"` |
-| 01 | default | `ns: "acmeshopdb.customer_profiles"`, `appName: "AcmeBillingService"`, `filter: {"email":"alice.smith@acme-corp.com"}` | `"xxxxxxxxxx.xxxxxxxx_xxxxxxxx"`, `"xxxxxxxxxxxxxxxxxx"`, `"{\"xxxxx\": \"xxxxx.xxxxx@xxxx-xxxx.xxx\"}"` |
-| 10 | default | same line | filter replaced as one blob (as 01) |
-| 11 | `--pii` | `filter: {"email":"alice.smith@acme-corp.com"}` | `{"email": "xxxxx.xxxxx@xxxx-xxxx.xxx"}` (structure kept) |
-| 12 | `--pii --seed it-seed` | `documents:[{"_id":"C-dup-canary-0001","name":"Alice Smith","phone":"+1-555-010-9999","identity":{"ssn":"123-45-6789"...` | `{"_id":"x-xxx-xxxxxx-xxxx","name":"xxxxx xxxxx","phone":"+x-xxx-xxx-xxxx","identity":{"ssn":"xxx-xx-xxxx"...` |
-| 13 | `--pii --redactNamespaces` | `ns: "acmeshopdb.customer_profiles"`, `find: "customer_profiles"`, `$db: "acmeshopdb"` | `"REDACTED_9fb2ea45.REDACTED_15c3e987"`, `"REDACTED_15c3e987"`, `"REDACTED_9fb2ea45"` |
-| 14 | `--pii` | `principalName: "mary.watson"`, `error: "UserNotFound: User \"mary.watson@admin\" not found"` | `"xxxx.xxxxxx"`, `"UserNotFound: User \"xxxx.xxxxxx@xxxxx\" not found"`; `authenticationDatabase: "admin"` and `remote: 127.0.0.1` kept |
-| 15 | `--pii --seed --redactNamespaces --addFields` | `errmsg: "not authorized on acmeshopdb to execute command { insert: \"customer_profiles\", ... UUID(\"bdfedbbb-...\")..."` | `"xxx xxxxxxxxxx xx xxxxxxxxxx xx xxxxxxx xxxxxxx { xxxxxx: \"xxxxxxxx_xxxxxxxx\", ... xx: xxxx(\"xxxxxxxx-xxxx-...\")..."` |
-| 16 | `--strict` | `filter: {"unlistedField":"filter-unlisted-canary-9"}` | `{"unlistedField":"xxxxxx-xxxxxxxx-xxxxxx-x"}` |
-| 17 | `--strict --redactNamespaces --seed k` | `splitPoint:{"customerId":"chunk-split-canary-5000"}`, `namespace:"acmeshopdb.customer_profiles"`, `shardId:"shard1"` | `{"customerId":"xxxxx-xxxxx-xxxxxx-xxxx"}`, `"REDACTED_0bf62d8a.REDACTED_a400b7a1"`, `"xxxxxx"`; `MinKey`/`MaxKey` kept |
-| 18 | `--pii --single_pass` | `application.name:"AcmeBillingService"`, `driver:"PyMongo\|c"`, `os:"Darwin"` | name -> `"xxxxxxxxxxxxxxxxxx"`; driver and OS kept |
-| 19 | `--pii --addFields grId` | documents with `email`, `address`, `ssn`, `creditCard "4111 1111 1111 1111"`, `grId` | all values x'd, e.g. `"xxxx xxxx xxxx xxxx"` |
-| 20 | `--strict` | `unlistedField: "filter-unlisted-canary-9"` | `"xxxxxx-xxxxxxxx-xxxxxx-x"` |
-| 30 | `--strict` | documents with email, SSN, card, IBAN, MAC | `"xxx-xxx-xxxxxx@xxxx-xxxx.xxx"`, `"xxx-xx-xxxx"`, `"xxxx xxxx xxxx xxxx"`, ... |
-| 31 | `--strict` | `filter:{"email":"alice.smith@acme-corp.com"}` | `{"email":"xxxxx.xxxxx@xxxx-xxxx.xxx"}` |
-| 40 | default | `pipeline:[{"$match":{"identity.ssn":"123-45-6789"}},{"$group":{"_id":1,"n":{"$sum":1}}}]` | one blob string `"[{\"$xxxxx\": {\"xxxxxxxx.xxx\": \"xxx-xx-xxxx\"}}, ...]"`; `lsid.id.$uuid` x'd |
-| 41 | `--pii` | same pipeline | `[{"$match":{"identity.ssn":"xxx-xx-xxxx"}},{"$group":{"_id":1,"n":{"$sum":1}}}]` |
-| 42 | `--strict --redactNamespaces` | same pipeline | ns -> `REDACTED_...`, SSN -> `"xxx-xx-xxxx"`, `"_id":1` and `"$sum":1` kept |
-| 50 | `--pii` | full "Authentication succeeded" line, `principalName:"acme_root_user"` | `"xxxx_xxxx_xxxx"`; `t/s/c/ctx/id/msg/attr` and `mechanism` untouched |
-| 51 | `--pii` | `durationMillis 0, nreturned 0, keysExamined 0, docsExamined 0, planSummary "COLLSCAN"` | identical (operational data preserved) |
-| 52 | `--pii --redactNamespaces` | `ns:"config.databases"`, `appName:"AcmeBillingService"`, `remote:"127.0.0.1:56795"`, `query:{"_id":"acmeshopdb"}` | `ns` kept, `appName:"xxxxxxxxxxxxxxxxxx"`, `remote` kept, `{"_id":"xxxxxxxxxx"}` |
-| 60 | `--pii --seed abc` | `principalName:"acme_root_user"` | `"xxxx_xxxx_xxxx"` |
-| 61 | `--pii` | `$match:{"tenant":"tenant-canary-acme-42"}`, `$project:{"email":1,"phone":1}`, `$out:"customer_profiles_archive"` | `"xxxxxx-xxxxxx-xxxx-xx"`, `$project` flags kept as `1`, `$out:"xxxxxxxx_xxxxxxxx_xxxxxxx"` |
-| 62 | `--pii` | `u:{"$set":{"phone":"555-010-9999"}}`, `q:{"orderNo":"txn-canary-order-7781"}` | `"xxx-xxx-xxxx"`; **`orderNo` unchanged** (unlisted field in a filter, see limits) |
-| 63 | `--pii` | a truncated JSON line; `Oct 7 host mongos[1]: {...}` | `{"s":"W","c":"REDACTOR","ctx":"ofuscator","id":0,"msg":"Unparseable log line redacted","attr":{"lineNumber":2,"line":"{\"x\":{\"$xxxx\":..."}}`; the syslog-prefixed line becomes a normal JSON entry |
+| Test | Options | Before | After |
+|------|---------|--------|-------|
+| `test_00_cluster_and_source_logs` | `(none)` | `{"options":{"net":{"port":27700},"processManagement":{"fork":true},"security":{"keyFile":"/tmp/ofuscator_it_XXXX/cluster/keyfile"},"sharding":{"configDB":"configRepl/localhost:27702"},"systemL...` | `{"options":{"net":{"port":27700},"processManagement":{"fork":true},"security":{"keyFile":"/xxx/xxxxxxx/x_/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/x/xxxxxxxxx_xx_xxxxxxxx/xxxxxxx/xxxxxxx"},"sharding":{"configDB":"xxxxxxxxxx/xxxxxxxxx:xxxxx"},"systemL...` |
+| `test_01_canaries_actually_reach_the_logs` | `(none)` | `{"ns":"acmeshopdb.customer_profiles","appName":"AcmeBillingService","command.filter":{"email":"alice.smith@acme-corp.com"}}` | `{"ns":"xxxxxxxxxx.xxxxxxxx_xxxxxxxx","appName":"xxxxxxxxxxxxxxxxxx","command.filter":{"email":"###"}}` |
+| `test_10_matrix_default` | `(none)` | `{"ns":"acmeshopdb.customer_profiles","appName":"AcmeBillingService","command.filter":{"email":"alice.smith@acme-corp.com"},"remote":"127.0.0.1:51771"}` | `{"ns":"xxxxxxxxxx.xxxxxxxx_xxxxxxxx","appName":"xxxxxxxxxxxxxxxxxx","command.filter":{"email":"###"},"remote":"127.0.0.1:51771"}` |
+| `test_11_matrix_seed` | `--seed it-seed` | `{"ns":"acmeshopdb.customer_profiles","command.insert":"customer_profiles","command.documents":[{"_id":"C-dup-canary-0001","customerId":"C-99887766","name":"Alice Smith","email":"dup-key-canary@acme-corp.com","alternateEmails":["carol.white@...` | `{"ns":"xxxxxxxxxx.xxxxxxxx_xxxxxxxx","command.insert":"###","command.documents":[{"_id":"###","customerId":"###","name":"###","email":"###","alternateEmails":["###"],"phone":"###","address":"###","identity":{"ssn":"###","passportNumber":"##...` |
+| `test_12_matrix_redactns` | `--redactNamespaces` | `{"namespace":"acmeshopdb.customer_profiles","shardId":"shard1"}` | `{"namespace":"REDACTED_24fc4a94.REDACTED_526d7bb9","shardId":"xxxxxx"}` |
+| `test_13_matrix_x` | `(none)` | `{"principalName":"mary.watson","authenticationDatabase":"admin","remote":"127.0.0.1:51799","error":"UserNotFound: User \"mary.watson@admin\" not found"}` | `{"principalName":"xxxx.xxxxxx","authenticationDatabase":"admin","remote":"127.0.0.1:51799","error":"UserNotFound: ###"}` |
+| `test_14_matrix_everything` | `--seed it --redactNamespaces --addFields $comment,_tid,grId` | `{"error":{"code":13,"codeName":"Unauthorized","errmsg":"not authorized on acmeshopdb to execute command { insert: \"customer_profiles\", ordered: true, lsid: { id: UUID(\"ba611968-27c4-4c7d-9758-87c90167b8ff\") }, txnNumber: 1, $clusterTime...` | `{"error":{"code":13,"codeName":"Unauthorized","errmsg":"###"}}` |
+| `test_15_matrix_x_redactns_seed` | `--redactNamespaces --seed k` | `{"chunkRange":"[{ customerId: MinKey }, { customerId: MaxKey })","splitPoint":{"customerId":"chunk-split-canary-5000"},"namespace":"acmeshopdb.customer_profiles","shardId":"shard1"}` | `{"chunkRange":"[{ customerId: MinKey }, { customerId: MaxKey })","splitPoint":{"customerId":"###"},"namespace":"REDACTED_0bf62d8a.REDACTED_a400b7a1","shardId":"xxxxxx"}` |
+| `test_16_matrix_single_pass` | `--single_pass` | `{"remote":"127.0.0.1:51770","doc.application":{"name":"AcmeBillingService"},"doc.driver.name":"PyMongo\|c","doc.os.type":"Darwin"}` | `{"remote":"127.0.0.1:51770","doc.application":{"name":"xxxxxxxxxxxxxxxxxx"},"doc.driver.name":"PyMongo\|c","doc.os.type":"Darwin"}` |
+| `test_19_addfields_removes_custom_field` | `--addFields grId` | `{"grId":"grid-canary-xyz-001","tenantRef":"schema-canary-tenantref-77","customer":{"vipCode":"schema-canary-path-vip-1"},"vendor":{"vipCode":"keep-canary-vendor-vip-5"}}` | `{"grId":"xxxx-xxxxxx-xxx-xxx","tenantRef":"schema-canary-tenantref-77","customer":{"vipCode":"schema-canary-path-vip-1"},"vendor":{"vipCode":"keep-canary-vendor-vip-5"}}` |
+| `test_20_default_removes_values_of_unlisted_fields` | `(none)` | `{"command.filter":{"unlistedField":"filter-unlisted-canary-9"}}` | `{"command.filter":{"unlistedField":"###"}}` |
+| `test_30_shape_scan_x_mode` | `(none)` | `{"command.documents":[{"_id":"C-dup-canary-0001","customerId":"C-99887766","name":"Alice Smith","email":"dup-key-canary@acme-corp.com","alternateEmails":["carol.white@acme-corp.com"],"phone":"+1-555-010-9999","address":"Wonderland Street 42...` | `{"command.documents":[{"_id":"###","customerId":"###","name":"###","email":"###","alternateEmails":["###"],"phone":"###","address":"###","identity":{"ssn":"###","passportNumber":"###","email":"###"},"financial":{"creditCard":"###","iban":"#...` |
+| `test_31_shape_scan_word_mode` | `(none)` | `{"command.filter":{"email":"alice.smith@acme-corp.com"}}` | `{"command.filter":{"email":"###"}}` |
+| `test_40_parity_default` | `(none)` | `{"command.pipeline":[{"$match":{"identity.ssn":"123-45-6789"}},{"$group":{"_id":1,"n":{"$sum":1}}}]}` | `{"command.pipeline":[{"$match":{"identity.ssn":"###"}},{"$group":{"_id":"###","n":{"$sum":"###"}}}]}` |
+| `test_41_parity_redactns` | `--redactNamespaces` | `{"ns":"acmeshopdb.customer_profiles","command.aggregate":"customer_profiles"}` | `{"ns":"REDACTED_24fc4a94.REDACTED_526d7bb9","command.aggregate":"###"}` |
+| `test_50_redacted_logs_remain_parseable` | `(none)` | `{"mechanism":"SCRAM-SHA-256","speculative":true,"principalName":"acme_root_user","authenticationDatabase":"admin","remote":"127.0.0.1:51771","extraInfo":{}}` | `{"mechanism":"SCRAM-SHA-256","speculative":true,"principalName":"xxxx_xxxx_xxxx","authenticationDatabase":"admin","remote":"127.0.0.1:51771","extraInfo":{}}` |
+| `test_51_operational_metrics_preserved` | `(none)` | `{"durationMillis":0,"nreturned":0,"keysExamined":0,"docsExamined":0,"planSummary":"COLLSCAN"}` | `{"durationMillis":0,"nreturned":0,"keysExamined":0,"docsExamined":0,"planSummary":"COLLSCAN"}` |
+| `test_52_system_namespaces_and_loopback_kept` | `--redactNamespaces` | `{"ns":"config.databases","appName":"AcmeBillingService","remote":"127.0.0.1:51737","command.query":{"_id":"acmeshopdb"}}` | `{"ns":"config.databases","appName":"xxxxxxxxxxxxxxxxxx","remote":"127.0.0.1:51737","command.query":{"_id":"###"}}` |
+| `test_53_bindata_6_and_8_masked_by_default_in_every_mode` | `(none)` | `{"command.filter":{"secretBlob":{"$binary":{"base64":"YmluZGF0YS1jaXBoZXItY2FuYXJ5LTY=","subType":"6"}},"sensitiveBlob":{"$binary":{"base64":"YmluZGF0YS1zZW5zaXRpdmUtY2FuYXJ5LTg=","subType":"8"}}}}` | `{"command.filter":{"secretBlob":"###","sensitiveBlob":"###"}}` |
+| `test_54_default_equals_server_reference_model_on_real_logs` | `(none)` | `{"command":{"aggregate":"customer_profiles","pipeline":[{"$match":{"identity.ssn":"123-45-6789"}},{"$group":{"_id":1,"n":{"$sum":1}}}],"cursor":{},"lsid":{"id":{"$uuid":"4c2db123-8f6c-457e-adec-e6e669825bd4"}},"$clusterTime":{"clusterTime":...` | `{"command":{"aggregate":"###","pipeline":[{"$match":{"identity.ssn":"###"}},{"$group":{"_id":"###","n":{"$sum":"###"}}}],"cursor":{},"lsid":{"id":"###"},"$clusterTime":{"clusterTime":"###","signature":{"hash":"###","keyId":"###"}},"$db":"##...` |
+| `test_55_default_status_forms_and_fixpoint` | `(none)` | `{"error":"UserNotFound: User \"mary.watson@admin\" not found"}` | `{"error":"UserNotFound: ###"}` |
+| `test_56_schema_file_and_add_fields_combinations` | `--loadSchemaFile schema.json --addFields grId` | `{"grId":"grid-canary-xyz-001","tenantRef":"schema-canary-tenantref-77","customer":{"vipCode":"schema-canary-path-vip-1"},"loyalty":{"tier":"schema-canary-nested-tier-9"},"vendor":{"vipCode":"keep-canary-vendor-vip-5"}}` | `{"grId":"xxxx-xxxxxx-xxx-xxx","tenantRef":"xxxxxx-xxxxxx-xxxxxxxxx-xx","customer":{"vipCode":"xxxxxx-xxxxxx-xxxx-xxx-x"},"loyalty":{"tier":"xxxxxx-xxxxxx-xxxxxx-xxxx-x"},"vendor":{"vipCode":"keep-canary-vendor-vip-5"}}` |
+| `test_57_schema_file_with_addfields_is_additive_and_deterministic` | `--loadSchemaFile schema.json --addFields grId --seed abc` | `{"grId":"grid-canary-xyz-001","tenantRef":"schema-canary-tenantref-77","customer":{"vipCode":"schema-canary-path-vip-1"},"loyalty":{"tier":"schema-canary-nested-tier-9"},"vendor":{"vipCode":"keep-canary-vendor-vip-5"}}` | `{"grId":"xxxx-xxxxxx-xxx-xxx","tenantRef":"xxxxxx-xxxxxx-xxxxxxxxx-xx","customer":{"vipCode":"xxxxxx-xxxxxx-xxxx-xxx-x"},"loyalty":{"tier":"xxxxxx-xxxxxx-xxxxxx-xxxx-x"},"vendor":{"vipCode":"keep-canary-vendor-vip-5"}}` |
+| `test_60_seed_determinism_and_salting` | `--seed abc` | `{"principalName":"acme_root_user","authenticationDatabase":"admin","remote":"127.0.0.1:51771","mechanism":"SCRAM-SHA-256"}` | `{"principalName":"xxxx_xxxx_xxxx","authenticationDatabase":"admin","remote":"127.0.0.1:51771","mechanism":"SCRAM-SHA-256"}` |
+| `test_61_no_unsalted_md5_of_sensitive_values` | `(none)` | `{"ns":"acmeshopdb.customer_profiles","command.pipeline":[{"$match":{"tenant":"tenant-canary-acme-42"}},{"$project":{"email":1,"phone":1}},{"$out":"customer_profiles_archive"}]}` | `{"ns":"xxxxxxxxxx.xxxxxxxx_xxxxxxxx","command.pipeline":[{"$match":{"tenant":"###"}},{"$project":{"email":"###","phone":"###"}},{"$out":"###"}]}` |
+| `test_62_idempotent_and_still_json_on_second_pass` | `(none)` x2 | `{"command.filter":{"email":"###"},"command.find":"###"}` (output of pass 1) | `{"command.filter":{"email":"###"},"command.find":"###"}` (pass 2: unchanged masks) |
+| `test_63_damaged_real_log_fails_closed_and_stays_json` | `(none)` | `"mith@acme-corp.com\"},\"lsid\":{\"id\":{\"$uuid\":\"4c2db123-8f6c-457e-adec-e6e669825bd4\"}},\"$clusterTime\":{\"clusterTi"` (truncated line); `Oct 7 host mongos[1]: {...}` | `{"s":"W","c":"REDACTOR","ctx":"ofuscator","id":0,"msg":"Unparseable log line redacted","attr":{"lineNumber":2,"line":"{\"x\":{\"$xxxx\":\"xxxx-xx-xxxxx:xx:xx.xxx+xx:xx\"},\"x\":\"x\",  \"x\":\"xxxxxxx...` ; `{"find":"###","filter":{"email":"###"},"lsid":{"id":"###"},"$clusterTime":{"clusterTime":"###","signature":{"hash":"###"...` |
+
+Reading the table: client data (`command.*`) is `###` in both styles; names, hosts, users, apps, `remote` and
+namespaces take the x-pattern; `127.0.0.1`, `admin`, counters and plan summaries are kept; `test_56`/`57` use the
+injected non-client-data probe.
 
 ---
 
 ## 5. Observations and known limits
 
-- **Unlisted field names in filters.** Plain `--pii` keeps values of field
-  names that are neither built-in PII keys nor in `--addFields` when they sit
-  in a *filter / update / pipeline* (test 62: `orderNo`). Payload documents
-  (`insert.documents`, oplog `o` / `o2`, `errInfo`, shard-key bounds, ...) are
-  always fully redacted with `--pii`. Use `--strict` to redact every literal.
-- **Bare system collection names.** `ns: "config.databases"` is kept, but the
-  same name as a lone command argument (`findAndModify: "databases"`) is
-  redacted with `--redactNamespaces`, because a single name has no database
-  context. Harmless but inconsistent (test 52).
-- **Server redaction is a subset of this tool.** With `--server_redaction` the client-data attributes equal the server's output, but names, hosts, users, apps, IPs and infrastructure text (which the server leaves visible) are still redacted by the rest of the tool. The deliberate deviations are listed in section 3b.
+- **Client data loses its detail.** The default mirrors the server, so inside a command everything is `###`, including `limit`, `batchSize`, `maxTimeMS`, `writeConcern`, `ordered`, the collection name and `$db` (the real servers do the same, section 3c). Query-shape analysis relies on field names, operators, plan summaries, counters and durations, which are kept.
+- **Unlisted field names.** Inside client data they no longer survive. Outside client data (a custom attribute such as `attr.myStuff`) a value is redacted only when its key is a built-in PII name or is named with `--addFields` / `--loadSchemaFile`, or when its content looks like PII (email, card, SSN, IP, host, token, path ...).
+- **The tool is stricter than the server.** With `redactClientLogData=true` the real servers still print namespaces, `appName`, users, hosts and many `error` reasons (e.g. `not authorized on <db> to execute command {`, `Error connecting to localhost:27701`); the default policy masks all of them (section 3c).
+- **Deliberate deviation from the server.** The keys of `sort` / `hint` / `projection` / `fields` (index and field names) are obfuscated, the server leaves them visible.
 - **Schema paths are contiguous.** `customer.vipCode` does not match `customer.items.$[e].vipCode`; use the bare name `vipCode` in `fields` to match at any depth. Paths are matched on keys (and `$ref` / `path: value` text); a value that merely *contains* the field name in prose is not detected.
-- **Hash salt.** Hashes and `REDACTED_<hash>` tokens are keyed with `--seed`
-  (random per-run key without a seed). Tokens correlate across files only with
-  the same seed.
-- **mtools 1.7.2** cannot parse 4.4+ JSON logs (no datetime even for the original
-  log), so it is used only to start the cluster; a built-in logv2 validator does
-  the parse check. On legacy text logs `mloginfo` is used as the independent parse check.
-- **Duplicate-key error text** is not written by 4.4-8.0 to the log (write
-  errors are returned to the client); the command itself is logged and is
-  covered. The error-text masker is covered by the "not authorized on ..." line
-  (test 15) and the unit corpus.
-- **FTDC**: `--ftdc_redact` only rewrites `hostInfo` of type-0 chunks; the
-  compressed reference document of type-1 chunks (e.g. `replSetGetStatus` member
-  hostnames) is passed through unchanged. Not covered by these tests.
-- **Disk side effect**: versions downloaded by `m` for the integration run stay
-  installed (`m rm <version>` to remove).
+- **Words and tokens are keyed.** The fruit / colour word and the `REDACTED_<hash>` token of a value are an HMAC of the value under the `--seed` key (random per-run key without a seed): the same name gets the same word in every file with the same seed, in any order and with any options (`test_seed_gives_the_same_words_across_files_order_and_options`, `test_57`).
+- **mtools 1.7.2** cannot parse 4.4+ JSON logs (no datetime even for the original log), so it is used only to start the cluster; a built-in logv2 validator does the parse check. On legacy text logs `mloginfo` is used as the independent parse check.
+- **Duplicate-key error text** is not written by 4.4-8.0 to the log (write errors are returned to the client); the command itself is logged and is covered. The error-text masker is exercised by the "not authorized on ..." line and the unit corpus.
+- **FTDC**: `--ftdc_redact` only rewrites `hostInfo` of type-0 chunks; the compressed reference document of type-1 chunks (e.g. `replSetGetStatus` member hostnames) is passed through unchanged. Not covered by these tests.
+- **Disk side effect**: versions downloaded by `m` for the integration run stay installed (`m rm <version>` to remove).
