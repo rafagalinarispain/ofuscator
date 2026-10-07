@@ -561,7 +561,7 @@ def _ofuscate(logpath, *flags):
 
 def _run_ground_truth_cluster(version, bin_dir, base):
     """Second, identical cluster whose SERVER redacts its own logs
-    (enterprise security.redactClientLogData=true): the oracle for --server_redaction."""
+    (enterprise security.redactClientLogData=true): the reference for --server_redaction."""
     if not version.endswith('-ent'):
         sys.stderr.write('[test] --ground-truth needs an enterprise build (e.g. 5.0.31-ent); '
                          'ground-truth tests will be skipped\n')
@@ -949,7 +949,7 @@ class RealLogs(CompactAsserts):
         # documented behaviour: unlisted FILTER values survive plain --pii
         self.assertIn('filter-unlisted-canary-9', plain)
 
-    # -- 2. independent shape oracle (does not know our canaries) ------------
+    # -- 2. independent shape scan (does not know our canaries) ------------
     def _string_leaves(self, text):
         acc = set()
         for ln in text.splitlines():
@@ -957,7 +957,7 @@ class RealLogs(CompactAsserts):
                 all_strings(json.loads(ln), acc)
         return acc
 
-    def test_30_shape_oracle_x_mode(self):
+    def test_30_shape_scan_x_mode(self):
         """In x-pattern mode no PII *shape* may remain in any string."""
         for name, path in STATE['logs'].items():
             strings = self._string_leaves(_ofuscate(path, '--strict', '--char_replacement').stdout)
@@ -972,7 +972,7 @@ class RealLogs(CompactAsserts):
                     self.assertTrue(ip.startswith(('127.', '0.')) or set(ip) <= set('x.'),
                                     f'{name}: raw IP {ip} in {s_[:80]!r}')
 
-    def test_31_shape_oracle_word_mode(self):
+    def test_31_shape_scan_word_mode(self):
         from ofuscator import fruits, colors
         for name, path in STATE['logs'].items():
             for s_ in self._string_leaves(_ofuscate(path, '--strict').stdout):

@@ -23,7 +23,7 @@ under Rosetta), Python 3.9.6, pymongo 4.11.1, mtools 1.7.2, `m` 1.9.0.
 ```bash
 python3 test_ofuscator.py -v                     # unit suite, ~3 s
 python3 test_integration_mongo.py 5.0            # real cluster, ~2 min
-python3 test_integration_mongo.py 5.0.31-ent --ground-truth   # + enterprise server as oracle, ~3 min
+python3 test_integration_mongo.py 5.0.31-ent --ground-truth   # + enterprise server as the reference, ~3 min
 ```
 
 ---
@@ -180,7 +180,7 @@ change: all six failed there and pass now.
    a flag matrix and checked. The cluster is stopped and processes verified gone.
 5. With `--ground-truth` and an enterprise build (`5.0.31-ent`), a **second,
    identical cluster** runs the same workload with the server redacting its own
-   logs (`redactClientLogData=true`); its output is the oracle for
+   logs (`redactClientLogData=true`); its output is the reference for
    `--server_redaction` (section 3c).
 
 ### Results per version (community builds)
@@ -217,8 +217,8 @@ snapshot taken before any install.
 | 13 | `test_18c_matrix_server_redaction_x` | `--server_redaction --char_replacement --redactNamespaces --seed` | pass | pass | pass | pass | pass |
 | 14 | `test_19_addfields_removes_custom_field_in_filters` | `--addFields grId` removes a custom field | pass | pass | pass | pass | pass |
 | 15 | `test_20_strict_removes_unlisted_values` | `--strict` removes unlisted filter values; plain `--pii` keeps them (documented) | pass | pass | pass | pass | pass |
-| 16 | `test_30_shape_oracle_x_mode` | independent scan of every string: no email / SSN / Luhn card / JWT / raw IP shape in x mode | pass | pass | pass | pass | pass |
-| 17 | `test_31_shape_oracle_word_mode` | word mode: only `fruit@colour.com` emails, no SSN / JWT | pass | pass | pass | pass | pass |
+| 16 | `test_30_shape_scan_x_mode` | independent scan of every string: no email / SSN / Luhn card / JWT / raw IP shape in x mode | pass | pass | pass | pass | pass |
+| 17 | `test_31_shape_scan_word_mode` | word mode: only `fruit@colour.com` emails, no SSN / JWT | pass | pass | pass | pass | pass |
 | 18 | `test_40_parity_default` | fruit vs x style change exactly the same tokens (real logs) | pass | pass | pass | pass | pass |
 | 19 | `test_41_parity_pii` | ... with `--pii` | pass | pass | pass | pass | pass |
 | 20 | `test_42_parity_strict_redactns` | ... with `--strict --redactNamespaces` | pass | pass | pass | pass | pass |
@@ -287,7 +287,7 @@ to the unredacted logs of the first cluster.
 
 | Test | What it proves |
 |------|----------------|
-| `test_g0_server_really_redacts_and_what_it_leaves_visible` | the oracle works (>200 `"###"`, no email / SSN / card / IBAN / token) and shows what the SERVER leaves visible: `acmeshopdb`, `customer_profiles`, `AcmeBillingService`, `acme_root_user`, `mary.watson`, `jsmith_admin`, hostnames |
+| `test_g0_server_really_redacts_and_what_it_leaves_visible` | the reference cluster works (>200 `"###"`, no email / SSN / card / IBAN / token) and shows what the SERVER leaves visible: `acmeshopdb`, `customer_profiles`, `AcmeBillingService`, `acme_root_user`, `mary.watson`, `jsmith_admin`, hostnames |
 | `test_g1_our_command_masks_equal_the_servers_masks` | **every** distinct redacted command of the user ops (same `appName`) is identical in the server's log and in ours |
 | `test_g2_status_forms_match_where_the_server_masks_and_we_are_never_weaker` | where the server masks a Status we produce the same form; everywhere else we mask too |
 | `test_g3_idempotent_on_server_redacted_logs_and_stricter_elsewhere` | ofuscator on the server-redacted log keeps every `"###"`, removes the names the server left visible, and equals the reference model applied to the server's line |
@@ -414,7 +414,7 @@ that test. Only relevant fields are shown; `...` marks shortened values.
   the same seed.
 - **mtools 1.7.2** cannot parse 4.4+ JSON logs (no datetime even for the original
   log), so it is used only to start the cluster; a built-in logv2 validator does
-  the parse check. On legacy text logs `mloginfo` is used as the oracle.
+  the parse check. On legacy text logs `mloginfo` is used as the independent parse check.
 - **Duplicate-key error text** is not written by 4.4-8.0 to the log (write
   errors are returned to the client); the command itself is logged and is
   covered. The error-text masker is covered by the "not authorized on ..." line
