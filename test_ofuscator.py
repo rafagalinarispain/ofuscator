@@ -426,10 +426,10 @@ class LeakTests(unittest.TestCase):
         b = self.run_tool('--seed', 'abc').stdout
         self.assertEqual(a, b)
 
-    def test_seed_gives_the_same_words_across_files_order_and_options(self):
-        """With --seed a value maps to the same fruit / colour in EVERY file, whatever the
-        order, the other content and the other options (the words come from an HMAC of the
-        value, not from a shared random stream)."""
+    def test_seed_only_keys_the_redacted_namespace_tokens(self):
+        """There are no replacement words any more: by default every redacted value is
+        '###' whatever the seed.  The seed keys the REDACTED_<hash> tokens of
+        --redactNamespaces, which are the same in every file, in any order, with any option."""
         mk = lambda ns, app: L("COMMAND", "c", 1, "Slow query", {"ns": ns, "appName": app,
                                                                  "user": "jane.roe", "host": "h1.acme.net:27017"})
         fa = os.path.join(self.tmp.name, 'fa.log')
@@ -440,15 +440,20 @@ class LeakTests(unittest.TestCase):
         with open(fb, 'w') as fh:                       # other content, other order
             for e in (mk("zzz.first", "Other"), mk("a.b", "Third"), mk("shop.customers", "AcmeApp")):
                 fh.write(json.dumps(e) + '\n')
+
         def attr(path, line, *flags):
-            return json.loads(self.run_tool(*flags, '--seed', 'k', path=path).stdout.splitlines()[line])['attr']
-        a = attr(fa, 0)
+            return json.loads(self.run_tool(*flags, path=path).stdout.splitlines()[line])['attr']
+        # default: no words, no tokens - the seed changes nothing
+        d1, d2 = attr(fa, 0, '--seed', 'a'), attr(fa, 0, '--seed', 'b')
+        self.assertEqual(d1, d2)
+        self.assertEqual((d1['ns'], d1['appName'], d1['user'], d1['host']),
+                         ('###.###', '###', '###', '###:27017'))
+        # --redactNamespaces: stable keyed tokens across files, order and options
+        t = attr(fa, 0, '--redactNamespaces', '--seed', 'k')['ns']
+        self.assertRegex(t, r'^REDACTED_[0-9a-f]{8}\.REDACTED_[0-9a-f]{8}$')
         for flags in ([], ['--addFields', 'whatever'], ['--single_pass'], ['--char_fields', 'x']):
-            b = attr(fb, 2, *flags)
-            for key in ('ns', 'appName', 'user', 'host'):
-                self.assertEqual(a[key], b[key], (key, flags))
-        c = json.loads(self.run_tool('--seed', 'other', path=fa).stdout.splitlines()[0])['attr']
-        self.assertNotEqual(a['ns'], c['ns'])           # a different seed gives different words
+            self.assertEqual(attr(fb, 2, '--redactNamespaces', '--seed', 'k', *flags)['ns'], t, flags)
+        self.assertNotEqual(attr(fa, 0, '--redactNamespaces', '--seed', 'other')['ns'], t)
 
     def test_leading_blank_line_still_json(self):
         p = os.path.join(self.tmp.name, 'blank_first.log')
@@ -562,10 +567,13 @@ class LeakTests(unittest.TestCase):
         self._parity('--redactNamespaces')
 
     def test_char_fields_selective_keeps_coverage(self):
-        out = self.check(['--seed', 's', '--char_replacement',
-                          '--char_fields', 'emails,email,$comment,user'],
+        """With --char_fields ONLY the listed fields get the char pattern; every other
+        redacted value stays '###'."""
+        out = self.check(['--char_replacement', '--char_fields', 'emails,email,$comment,user'],
                          ALWAYS)
-        self.assertIn('@', out)       # fruit@colour.com style still used elsewhere
+        self.assertIn('###', out)                 # everything not listed
+        self.assertIn('"user": "xxxxxx_xxxxx"', out)    # jsmith_admin, listed -> x pattern
+        self.assertNotIn('"xxx"', out.replace('"user": "xxxxxx_xxxxx"', ''))   # no global CHAR*3 mask
 
     def test_legacy_text_log_both_styles(self):
         p = os.path.join(self.tmp.name, 'legacy.log')
@@ -640,18 +648,32 @@ _EXT = {'$oid', '$date', '$numberLong', '$numberInt', '$numberDouble', '$numberD
         '$maxKey', '$undefined', '$symbol', '$code', '$dbPointer'}
 
 
-def server_redact_all(v):
+def mask_for(flags):
+    """What '###' becomes: itself by default, CHAR*3 with --char_replacement [CHAR]."""
+    if '--char_replacement' in flags:
+        i = flags.index('--char_replacement')
+        nxt = flags[i + 1] if i + 1 < len(flags) else ''
+        return (nxt if len(nxt) == 1 and not nxt.startswith('-') else 'x') * 3
+    return MASK
+
+
+def with_mask(obj, mask):
+    """The same structure with every '###' replaced by `mask`."""
+    return json.loads(json.dumps(obj).replace(MASK, mask))
+
+
+def server_redact_all(v, mask=MASK):
     """Independent reference model of BSONObj::redact(RedactLevel::all):
-    keys and structure kept, arrays walked, every scalar -> "###"."""
+    keys and structure kept, arrays walked, every scalar -> the mask ("###")."""
     if isinstance(v, dict):
         ks = set(v)
         if (len(ks) == 1 and next(iter(ks)) in _EXT) or ks in (
                 {'$binary', '$type'}, {'$code', '$scope'}):
-            return MASK                      # an EJSON wrapper is ONE bson scalar
-        return {k: server_redact_all(x) for k, x in v.items()}
+            return mask                      # an EJSON wrapper is ONE bson scalar
+        return {k: server_redact_all(x, mask) for k, x in v.items()}
     if isinstance(v, list):
-        return [server_redact_all(x) for x in v]
-    return MASK
+        return [server_redact_all(x, mask) for x in v]
+    return mask
 
 
 def binary(b64, subtype):
@@ -703,9 +725,10 @@ class ServerPolicyTests(unittest.TestCase):
                 self.assertNotIn(canary, out, (flags, canary))
 
     def test_s1_mask_is_the_server_mask_and_replaces_the_whole_element(self):
-        for flags in ([], [], ['--char_replacement']):
+        for flags in ([], ['--char_replacement'], ['--char_replacement', '#']):
             a = self.run_attr({"generic": {"a": binary(B64_6, 6), "b": binary(B64_8, 8)}}, *flags)
-            self.assertEqual(a["generic"], {"a": MASK, "b": MASK}, flags)
+            m = mask_for(flags)
+            self.assertEqual(a["generic"], {"a": m, "b": m}, flags)
 
     def test_s1_other_subtypes_and_sibling_values_untouched(self):
         """Like the server's RedactSensitiveStringTest: with redactClientLogData off
@@ -734,8 +757,10 @@ class ServerPolicyTests(unittest.TestCase):
             got = a["command"]["documents"][0]
             for k, orig in doc.items():
                 self.assertNotEqual(got[k], orig, (flags, k, got[k]))
-            self.assertEqual(got["nested"], [MASK, MASK, got["nested"][2]])
-            self.assertNotEqual(got["nested"][2], 1)
+            m = mask_for(flags)
+            self.assertEqual(got["nested"][:2], [m, m])          # bool, null -> the mask
+            self.assertNotIn(got["nested"][2], (1, True))        # 1 -> '###' or 'x'
+            self.assertEqual(got["optedOut"], m)
 
     def test_default_keeps_keys_and_operators_but_masks_every_literal(self):
         """Same as the server with redactClientLogData=true (BSON level `all`): stage names,
@@ -748,10 +773,11 @@ class ServerPolicyTests(unittest.TestCase):
                              {"$group": {"_id": None, "n": {"$sum": 1}}},
                              {"$match": {"hivStatus": True, "status": "x"}}]}}, *flags)
             pl = a["command"]["pipeline"]
-            self.assertEqual(pl[0]["$project"], {"email": MASK, "phone": MASK, "_id": MASK})
-            self.assertEqual(pl[1]["$sort"], {"createdAt": MASK})
-            self.assertEqual(pl[2]["$group"], {"_id": MASK, "n": {"$sum": MASK}})
-            self.assertEqual(pl[3]["$match"], {"hivStatus": MASK, "status": MASK})
+            m = mask_for(flags)
+            self.assertEqual(pl[0]["$project"], {"email": m, "phone": m, "_id": m})
+            self.assertEqual(pl[1]["$sort"], {"createdAt": m})
+            self.assertEqual(pl[2]["$group"], {"_id": m, "n": {"$sum": m}})
+            self.assertEqual(pl[3]["$match"], {"hivStatus": m, "status": m})
             self.assertEqual([list(st)[0] for st in pl], ["$project", "$sort", "$group", "$match"])
 
     def test_default_builtin_pii_ref_inside_operand_array(self):
@@ -777,12 +803,12 @@ class ServerPolicyTests(unittest.TestCase):
     }
 
     def test_idempotent_on_server_redacted_logs_every_mode(self):
-        for flags in ([], [], [], ['--char_replacement'],
-                      ['--redactNamespaces'], [],
-                      ['--char_replacement']):
+        for flags in ([], ['--seed', 'k'], ['--char_replacement'], ['--char_replacement', '*'],
+                      ['--redactNamespaces']):
             a = self.run_attr(self.SERVER_REDACTED, *flags)
+            want = with_mask(self.SERVER_REDACTED, mask_for(flags))    # '###' -> CHAR*3 if asked
             for key in ("command", "error", "exception", "errMsg"):
-                self.assertEqual(a[key], self.SERVER_REDACTED[key], (flags, key))
+                self.assertEqual(a[key], want[key], (flags, key))
 
     # ---- --server_redaction = security.redactClientLogData=true ----------------------------
     SERVER_TEST_CASES = [       # taken from the server's own redaction_test.cpp
@@ -802,7 +828,7 @@ class ServerPolicyTests(unittest.TestCase):
         for src, want in self.SERVER_TEST_CASES:
             for flags in ([], ['--char_replacement']):
                 a = self.run_attr({"command": {"find": "c", "filter": src, "$db": "d"}}, *flags)
-                self.assertEqual(a["command"]["filter"], want, (src, flags))
+                self.assertEqual(a["command"]["filter"], with_mask(want, mask_for(flags)), (src, flags))
 
     def test_server_redaction_matches_reference_model(self):
         commands = [
@@ -824,10 +850,9 @@ class ServerPolicyTests(unittest.TestCase):
                               "signature": {"hash": binary("AAAA", 0), "keyId": 7}}},
         ]
         for cmd in commands:
-            want = server_redact_all(cmd)
-            for flags in ([], ['--char_replacement']):
+            for flags in ([], ['--char_replacement'], ['--char_replacement', '*']):
                 got = self.run_attr({"command": cmd}, *flags)["command"]
-                self.assertEqual(got, want, (list(cmd)[0], flags))
+                self.assertEqual(got, server_redact_all(cmd, mask_for(flags)), (list(cmd)[0], flags))
 
     def test_server_redaction_schema_keys_are_still_obfuscated(self):
         """Deliberate deviation: the server keeps the keys of sort / hint / projection
@@ -839,8 +864,11 @@ class ServerPolicyTests(unittest.TestCase):
             blob = json.dumps(got)
             for name in ("notes_secret_index", "ssn_lookup_idx", "identity.ssn"):
                 self.assertNotIn(name, blob, flags)
-            self.assertEqual(set(got["sort"].values()), {MASK})       # values are masked
-            self.assertEqual(got["filter"], {"a": MASK})
+            m = mask_for(flags)
+            self.assertEqual(set(got["sort"].values()), {m})          # values are masked
+            self.assertEqual(got["filter"], {"a": m})
+            self.assertEqual(len(got["sort"]), 1)                     # keys renamed, never dropped
+            self.assertEqual(len(got["hint"]), 1)
 
     def test_server_redaction_other_data_attrs_and_oplog_entry(self):
         """bgsync.cpp logs `lastOplogEntry = redact(oplogEntry)`."""
@@ -877,17 +905,28 @@ class ServerPolicyTests(unittest.TestCase):
                                      "errmsg": "not authorized on acmeshopdb to execute command"}})
         self.assertEqual(a["error"], {"code": 13, "codeName": "Unauthorized", "errmsg": MASK})
 
-    def test_server_redaction_mask_ignores_char_replacement_and_keeps_other_rules(self):
+    def test_char_replacement_turns_mask_into_char_pattern_and_names_keep_their_shape(self):
         attr = {"ns": "acmeshopdb.customers", "appName": "AcmeApp", "remote": "10.20.30.40:5555",
                 "command": {"find": "customers", "filter": {"email": "a@b.com"}, "$db": "acmeshopdb"},
                 "error": "Unauthorized: boom"}
-        word = self.run_attr(attr)
+        default = self.run_attr(attr)
         xpat = self.run_attr(attr, '--char_replacement')
-        self.assertEqual(word["command"], xpat["command"])            # "###" in both styles
-        self.assertEqual(word["error"], xpat["error"])
-        for a in (word, xpat):                                        # extra rules still apply
+        star = self.run_attr(attr, '--char_replacement', '*')
+        # default: everything is the server mask
+        self.assertEqual(default["command"], {"find": MASK, "filter": {"email": MASK}, "$db": MASK})
+        self.assertEqual((default["ns"], default["appName"], default["remote"], default["error"]),
+                         ("###.###", "###", "###:5555", "Unauthorized: ###"))
+        # --char_replacement: '###' -> xxx, names keep their shape
+        self.assertEqual(xpat["command"], {"find": "xxx", "filter": {"email": "xxx"}, "$db": "xxx"})
+        self.assertEqual((xpat["ns"], xpat["appName"], xpat["remote"], xpat["error"]),
+                         ("xxxxxxxxxx.xxxxxxxxx", "xxxxxxx", "xxx.xxx.xxx.xxx:5555", "Unauthorized: xxx"))
+        # --char_replacement '*': the same with another character
+        self.assertEqual(star["command"], {"find": "***", "filter": {"email": "***"}, "$db": "***"})
+        self.assertEqual((star["ns"], star["appName"], star["remote"], star["error"]),
+                         ("**********.*********", "*******", "***.***.***.***:5555", "Unauthorized: ***"))
+        for a in (default, xpat, star):                               # nothing readable survives
             blob = json.dumps(a)
-            for leak in ("acmeshopdb", "customers", "AcmeApp", "10.20.30.40", "a@b.com"):
+            for leak in ("acmeshopdb", "customers", "AcmeApp", "10.20.30.40", "a@b.com", "boom"):
                 self.assertNotIn(leak, blob)
 
     def test_server_redaction_canary_corpus_both_styles(self):
@@ -1064,7 +1103,7 @@ class SchemaFileTests(unittest.TestCase):
         p = os.path.join(self.tmp.name, 'client.log')
         with open(p, 'w') as fh:
             fh.write(json.dumps(client_data_entry()) + '\n')
-        outs = set()
+        outs = {'': set(), 'x': set()}
         for combo in COMBOS:
             for style in ([], ['--char_replacement']):
                 r = self.run_tool(*self.flags_for(combo, *style), log=p)
@@ -1076,9 +1115,10 @@ class SchemaFileTests(unittest.TestCase):
                 walk = lambda n: ([walk(x) for x in n.values()] if isinstance(n, dict)
                                   else [walk(x) for x in n] if isinstance(n, list) else leaves.append(n))
                 walk(filt)
-                self.assertEqual(set(leaves), {MASK}, (combo, style))
-                outs.add(json.dumps(filt, sort_keys=True))
-        self.assertEqual(len(outs), 1, 'the mask of client data must not depend on schema / --addFields')
+                self.assertEqual(set(leaves), {mask_for(style)}, (combo, style))
+                outs['x' if style else ''].add(json.dumps(filt, sort_keys=True))
+        for k, v in outs.items():     # per style: one result for all 4 combinations
+            self.assertEqual(len(v), 1, 'the mask of client data must not depend on schema / --addFields')
 
     def test_path_precision_vendor_not_redacted_by_customer_path(self):
         for combo in ('schema', 'schema+addFields'):
@@ -1285,6 +1325,190 @@ class SchemaFileTests(unittest.TestCase):
 
 SCHEMA_PLAIN = {'tenantRef': CAN_SCHEMA, 'vipCode': CAN_PATH, 'tier': CAN_NESTED}
 SRC_FIRST_LINE = {CAN_DEFAULT, CAN_ADD, CAN_SCHEMA, CAN_PATH, CAN_NESTED, CAN_KEEP}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# --char_replacement [CHAR]:  default '###';  with the option EVERYTHING becomes CHAR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CharReplacementTests(unittest.TestCase):
+    """Policy: default '###'.  --char_replacement [CHAR] (default 'x') covers everything:
+    '###' -> CHAR*3 and the values that used to get a fruit/colour word keep their shape."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.log = os.path.join(cls.tmp.name, 'corpus.log')
+        with open(cls.log, 'w') as fh:
+            for ent in build_entries():
+                fh.write(json.dumps(ent) + '\n')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def run_tool(self, *flags, log=None):
+        return subprocess.run([sys.executable, SCRIPT, '--log_redact', log or self.log, *flags],
+                              capture_output=True, text=True, timeout=300)
+
+    def one(self, attr, *flags):
+        ent = L("COMMAND", "c", 1, "m", attr)
+        p = os.path.join(self.tmp.name, 'one.log')
+        with open(p, 'w') as fh:
+            fh.write(json.dumps(ent) + '\n')
+        r = self.run_tool(*flags, log=p)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        return json.loads(r.stdout.splitlines()[0])['attr']
+
+    # ---- the three policies ----------------------------------------------------------------------
+    def test_default_is_the_mask_and_no_replacement_word_exists(self):
+        out = self.run_tool().stdout
+        self.assertIn('###', out)
+        self.assertNotIn('.invalid', out)                  # old fruit host alias
+        self.assertNotRegex(out, r'192\.168\.\d+\.\d+')    # old fake IPs
+        self.assertNotRegex(out, r'[a-z.]+@[a-z]+\.com"')    # old fruit@colour.com
+        for word in ('banana', 'strawberry', 'raspberry', 'darkcyan', 'blueberry', 'mangosteen'):
+            self.assertNotIn(word, out)                    # the word lists are gone
+
+    def test_char_replacement_without_argument_uses_x_and_covers_everything(self):
+        out = self.run_tool('--char_replacement').stdout
+        self.assertNotIn('###', out)                       # even the server mask is replaced
+        self.assertIn('xxx', out)
+        for ln in out.splitlines():
+            json.loads(ln)
+
+    def test_char_replacement_with_argument_uses_that_character(self):
+        for ch in ('*', '#', '0', '.', '"', '\\', 'Z'):
+            r = self.run_tool('--char_replacement', ch)
+            self.assertEqual(r.returncode, 0, (ch, r.stderr[-200:]))
+            for ln in r.stdout.splitlines():
+                json.loads(ln)                             # stays valid JSON for any character
+            if ch != '#':
+                self.assertNotIn('###', r.stdout, ch)
+            a = [json.loads(x) for x in r.stdout.splitlines()][0]
+            self.assertIn(json.dumps(ch * 3)[1:-1], json.dumps(a), ch)      # JSON-escaped for " and \\
+
+    def test_char_pattern_replaces_both_families_consistently(self):
+        attr = {"ns": "shop.customers", "appName": "Acme", "emails": ["a.b@acme.com"],
+                "remote": "10.1.2.3:99", "error": "Unauthorized: boom",
+                "command": {"find": "c", "filter": {"x": "v", "n": 5}, "$db": "shop"}}
+        d = self.one(attr)
+        x = self.one(attr, '--char_replacement')
+        s = self.one(attr, '--char_replacement', '*')
+        self.assertEqual(d["command"], {"find": "###", "filter": {"x": "###", "n": "###"}, "$db": "###"})
+        self.assertEqual(x["command"], {"find": "xxx", "filter": {"x": "xxx", "n": "xxx"}, "$db": "xxx"})
+        self.assertEqual(s["command"], {"find": "***", "filter": {"x": "***", "n": "***"}, "$db": "***"})
+        self.assertEqual((d["ns"], d["appName"], d["emails"], d["remote"], d["error"]),
+                         ("###.###", "###", ["###"], "###:99", "Unauthorized: ###"))
+        self.assertEqual((x["ns"], x["appName"], x["emails"], x["remote"], x["error"]),
+                         ("xxxx.xxxxxxxxx", "xxxx", ["x.x@xxxx.xxx"], "xxx.xxx.xxx.xxx:99", "Unauthorized: xxx"))
+        self.assertEqual((s["ns"], s["appName"], s["emails"], s["remote"], s["error"]),
+                         ("****.*********", "****", ["*.*@****.***"], "***.***.***.***:99", "Unauthorized: ***"))
+
+    def test_every_value_redacted_by_default_is_redacted_with_the_char(self):
+        """Coverage parity on the whole corpus: a token changes with the char pattern
+        exactly where it changes by default."""
+        def flat(n, acc):
+            if isinstance(n, dict):
+                for k, v in n.items():
+                    flat(v, acc)
+            elif isinstance(n, list):
+                for v in n:
+                    flat(v, acc)
+            else:
+                acc.append(n)
+            return acc
+        src = [json.loads(x) for x in open(self.log)]
+        d = [json.loads(x) for x in self.run_tool().stdout.splitlines()]
+        x = [json.loads(y) for y in self.run_tool('--char_replacement', '*').stdout.splitlines()]
+        bad = []
+        for i, (o, a, b) in enumerate(zip(src, d, x)):
+            fo, fa, fb = flat(o, []), flat(a, []), flat(b, [])
+            if not (len(fo) == len(fa) == len(fb)):
+                continue          # a blob-level collapse changes the leaf count equally in both
+            for vo, va, vb in zip(fo, fa, fb):
+                if isinstance(vo, str) and any(c.isalnum() for c in vo) and (vo != va) != (vo != vb):
+                    bad.append((i, vo[:40], va, vb))
+        self.assertEqual(bad[:5], [])
+
+    # ---- argument parsing / validation -----------------------------------------------------------------
+    def test_argument_validation(self):
+        for bad in ('ab', '', ' ', '\t', 'xx', '###'):
+            r = self.run_tool('--char_replacement', bad)
+            self.assertEqual(r.returncode, 2, (bad, r.stdout[:80]))
+            self.assertIn('--char_replacement', r.stderr)
+            self.assertNotIn('Traceback', r.stderr)
+
+    def test_flag_before_other_options_does_not_swallow_them(self):
+        a = self.run_tool('--char_replacement', '--seed', 'k', '--redactNamespaces')
+        self.assertEqual(a.returncode, 0, a.stderr[-200:])
+        self.assertIn('REDACTED_', a.stdout)
+        self.assertNotIn('###', a.stdout)
+        b = self.run_tool('--char_replacement', '*', '--seed', 'k')
+        self.assertEqual(b.returncode, 0)
+        self.assertIn('***', b.stdout)
+
+    def test_rejected_for_ftdc(self):
+        r = subprocess.run([sys.executable, SCRIPT, '--ftdc_redact', '--input_dir', self.tmp.name,
+                            '--output_dir', self.tmp.name + '/o', '--char_replacement', '*'],
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('only valid with --log_redact', r.stderr)
+
+    # ---- Unicode: the old pattern only matched ASCII and leaked 'ü', 'ë' ... -----------------------
+    def test_non_ascii_letters_are_replaced_too(self):
+        a = self.one({"user": "Jürgen Müller", "emails": ["zoë@acme.com"], "appName": "Café Zürich 日本語",
+                      "principalName": "Søren Ångström"}, '--char_replacement', '*')
+        blob = json.dumps(a, ensure_ascii=False)
+        for leak in ("ü", "ë", "é", "ö", "ø", "Å", "日", "本", "語", "ÿ"):
+            self.assertNotIn(leak, blob)
+        self.assertEqual(a["user"], "****** ******")
+        self.assertEqual(a["emails"], ["***@****.***"])
+        self.assertEqual(a["principalName"], "***** ********")
+
+    # ---- idempotence: re-running on a server-redacted or char-redacted log -----------------------------
+    def test_idempotent_on_already_masked_and_on_char_output(self):
+        masked = {"command": {"find": "###", "filter": {"a": "###"}}, "error": "Unauthorized: ###"}
+        for flags, want in (([], "###"), (['--char_replacement'], "xxx"), (['--char_replacement', '*'], "***")):
+            a = self.one(masked, *flags)
+            self.assertEqual(a["command"], {"find": want, "filter": {"a": want}}, flags)
+            self.assertEqual(a["error"], f"Unauthorized: {want}", flags)
+            again = self.one(a, *flags)                   # second pass on the char output
+            self.assertEqual(again["command"], a["command"], flags)
+            self.assertEqual(again["error"], a["error"], flags)
+
+    # ---- legacy text logs ----------------------------------------------------------------------------------
+    def test_legacy_text_log(self):
+        p = os.path.join(self.tmp.name, 'legacy.log')
+        with open(p, 'w') as fh:
+            fh.write('2019-03-01T10:00:00.123+0000 I COMMAND  [conn7] command acmeshopdb.customers command: '
+                     'find { find: "customers", filter: { email: "alice.smith@acme-corp.com", ssn: 123456789 } } '
+                     'planSummary: IXSCAN { email: 1 } 10.20.30.40:5555 protocol:op_msg 12ms\n')
+        d = self.run_tool(log=p).stdout
+        x = self.run_tool('--char_replacement', log=p).stdout
+        s = self.run_tool('--char_replacement', '*', log=p).stdout
+        for out in (d, x, s):
+            for leak in ('alice.smith', '123456789', '10.20.30.40', 'acmeshopdb', 'customers'):
+                self.assertNotIn(leak, out)
+            self.assertIn('protocol:op_msg 12ms', out)
+        self.assertIn('"###"', d)
+        self.assertNotIn('###', x + s)
+        self.assertIn('"xxx', x.replace('"xxxxx', '"xxx'))
+        self.assertIn('***.***.***.***:5555', s)
+
+    # ---- numbers and selective mode ---------------------------------------------------------------------------
+    def test_numbers_outside_client_data(self):
+        attr = {"phone": 5550109999, "sessionId": 123456789, "pwd": 4321, "port": 27017}
+        self.assertEqual(self.one(attr), {"phone": "###", "sessionId": "###", "pwd": "###", "port": 27017})
+        self.assertEqual(self.one(attr, '--char_replacement', '9'),
+                         {"phone": "9999999999", "sessionId": "999999999", "pwd": "9999", "port": 27017})
+
+    def test_char_fields_selective(self):
+        a = self.one({"user": "jane.roe", "appName": "Acme", "command": {"find": "c", "$db": "d"}},
+                     '--char_replacement', '*', '--char_fields', 'user')
+        self.assertEqual(a["user"], "****.***")           # listed -> char pattern
+        self.assertEqual(a["appName"], "###")             # not listed -> mask
+        self.assertEqual(a["command"], {"find": "###", "$db": "###"})
 
 
 if __name__ == '__main__':

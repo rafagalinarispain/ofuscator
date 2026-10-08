@@ -712,6 +712,15 @@ def is_mask(s):
     return not re.search(r'[A-Za-wyzA-WYZ0-9]', s)
 
 
+def mask_for(flags):
+    """What '###' becomes: itself by default, CHAR*3 with --char_replacement [CHAR]."""
+    if '--char_replacement' in flags:
+        i = flags.index('--char_replacement')
+        nxt = flags[i + 1] if i + 1 < len(flags) else ''
+        return (nxt if len(nxt) == 1 and not nxt.startswith('-') else 'x') * 3
+    return '###'
+
+
 IPV4 = re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])')
 EMAIL = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}')
 SSN = re.compile(r'(?<![\d-])\d{3}-\d{2}-\d{4}(?![\d-])')
@@ -741,6 +750,7 @@ MATRIX = {          # the DEFAULT policy (deep PII + every literal + server-styl
     'everything':           ['--seed', 'it', '--char_replacement',
                              '--redactNamespaces', '--addFields', '$comment,_tid,grId'],
     'x_redactns_seed':      ['--char_replacement', '--redactNamespaces', '--seed', 'k'],
+    'star':                 ['--char_replacement', '*'],
     'single_pass':          ['--single_pass'],
 }
 
@@ -753,7 +763,7 @@ def strip_schema(cmd):
     return {k: v for k, v in cmd.items() if k not in SCHEMA_CMD_KEYS}
 
 
-def server_redact_all(v):
+def server_redact_all(v, mask='###'):
     """Reference model of BSONObj::redact(RedactLevel::all) (bsonobj.cpp): keys and
     structure kept, arrays walked, every scalar -> "###"; an extended-JSON wrapper is
     one BSON scalar."""
@@ -764,11 +774,11 @@ def server_redact_all(v):
         ks = set(v)
         if (len(ks) == 1 and next(iter(ks)) in ext) or ks in (
                 {'$binary', '$type'}, {'$code', '$scope'}):
-            return '###'
-        return {k: server_redact_all(x) for k, x in v.items()}
+            return mask
+        return {k: server_redact_all(x, mask) for k, x in v.items()}
     if isinstance(v, list):
-        return [server_redact_all(x) for x in v]
-    return '###'
+        return [server_redact_all(x, mask) for x in v]
+    return mask
 
 
 STATUS_OUT_RE = re.compile(r'^(?:OK|###|[A-Za-z][A-Za-z0-9]*:? ###)$')
@@ -921,6 +931,7 @@ class RealLogs(CompactAsserts):
     def test_14_matrix_everything(self):        self._matrix_case('everything')
     def test_15_matrix_x_redactns_seed(self):   self._matrix_case('x_redactns_seed')
     def test_16_matrix_single_pass(self):       self._matrix_case('single_pass')
+    def test_17_matrix_custom_char(self):       self._matrix_case('star')
 
     def test_19_addfields_removes_custom_field(self):
         with_af = ''.join(_ofuscate(p, '--addFields', 'grId').stdout
@@ -967,18 +978,54 @@ class RealLogs(CompactAsserts):
                     self.assertTrue(ip.startswith(('127.', '0.')) or set(ip) <= set('x.'),
                                     f'{name}: raw IP {ip} in {s_[:80]!r}')
 
-    def test_31_shape_scan_word_mode(self):
-        from ofuscator import fruits, colors
+    def test_31_shape_scan_default_mask(self):
+        """Default policy: no replacement words exist, so no email / SSN / JWT shape and no
+        fake host / IP can appear in any string."""
         for name, path in STATE['logs'].items():
             for s_ in self._string_leaves(_ofuscate(path).stdout):
-                for e in EMAIL.findall(s_):
-                    local, dom = e.split('@')
-                    self.assertTrue(dom.endswith('.com') and dom[:-4] in colors and local in fruits,
-                                    f'{name}: real-looking email {e}')
+                self.assertEqual(EMAIL.findall(s_), [], (name, s_[:80]))
                 self.assertEqual(SSN.findall(s_), [], (name, s_[:80]))
                 self.assertEqual(JWT.findall(s_), [], (name, s_[:80]))
+                self.assertNotIn('.invalid', s_)
+                for ip in IPV4.findall(s_):
+                    self.assertTrue(ip.startswith(('127.', '0.')), f'{name}: IP {ip} in {s_[:80]!r}')
 
-    # -- 3. x-pattern and fruit-salad have identical coverage --------------------
+    def test_32_char_replacement_covers_everything_on_real_logs(self):
+        """--char_replacement [CHAR]: not a single '###' is left; client data is CHAR*3 and
+        names / hosts / users keep their shape with CHAR; valid logv2 JSON line by line."""
+        for ch in (None, '*'):
+            flags = ['--char_replacement'] + ([ch] if ch else [])
+            m = (ch or 'x') * 3
+            for name, path in STATE['logs'].items():
+                p = _ofuscate(path, *flags)
+                self.assertEqual(p.returncode, 0, p.stderr[-300:])
+                self.assertNotIn('###', p.stdout, (name, flags))
+                src = [json.loads(x) for x in read_lines(path)]
+                out = [json.loads(x) for x in p.stdout.splitlines()]
+                self.assertEqual(len(src), len(out))
+                checked = 0
+                for so, oo in zip(src, out):
+                    self.assertEqual(logv2_problems(oo), [], (name, flags))
+                    cmd = so.get('attr', {}).get('command')
+                    if isinstance(cmd, dict):
+                        self.assertEqual(strip_schema(oo['attr']['command']),
+                                         server_redact_all(strip_schema(cmd), m), (name, flags, so['id']))
+                        checked += 1
+                    for key in ('ns', 'appName'):
+                        v = so.get('attr', {}).get(key)
+                        if isinstance(v, str) and v and not v.startswith(('config.', 'local.', 'admin.')):
+                            w = oo['attr'][key]
+                            self.assertEqual(len(w), len(v), (key, v, w))      # shape kept
+                            c = ch or 'x'
+                            if key == 'appName':      # the whole value keeps its shape
+                                self.assertEqual(w, re.sub(r'[^\W_]', c, v), (key, v, w))
+                            else:                     # namespace: the db part is replaced
+                                first = v.split('.')[0]
+                                self.assertNotIn(first, w)
+                                self.assertTrue(w.startswith(re.sub(r'[^\W_]', c, first)), (key, v, w))
+                self.assertGreater(checked, 5)
+
+    # -- 3. the default '###' and the char pattern have identical coverage --------------------
     def _parity(self, *flags):
         for name, path in STATE['logs'].items():
             src = [json.loads(x) for x in read_lines(path)]
@@ -1089,8 +1136,7 @@ class RealLogs(CompactAsserts):
         shown = {c: c in src for c in C['bindata']}
         sys.stderr.write(f'\n[test] BinData 6/8 base64 present in the SOURCE logs of this '
                          f'server version: {shown}  (False = the server already masked it)\n')
-        for flags in ([], [], [], ['--char_replacement'],
-                      []):
+        for flags in ([], ['--char_replacement'], ['--char_replacement', '*']):
             out = ''.join(_ofuscate(p, *flags).stdout for p in STATE['logs'].values())
             for c in C['bindata']:
                 self.assertNotIn(c, out, (flags, c))
@@ -1209,10 +1255,12 @@ class RealLogs(CompactAsserts):
         b = run([sys.executable, SCRIPT, '--log_redact', path, '--seed', 'abc']).stdout
         c = run([sys.executable, SCRIPT, '--log_redact', path, '--seed', 'abd']).stdout
         self.assertEqual(a, b)
-        self.assertNotEqual(a, c)
-        u1 = run([sys.executable, SCRIPT, '--log_redact', path, '--redactNamespaces']).stdout
-        u2 = run([sys.executable, SCRIPT, '--log_redact', path, '--redactNamespaces']).stdout
-        self.assertNotEqual(u1, u2, 'unseeded tokens must use a random per-run salt')
+        self.assertEqual(a, c, 'by default every redacted value is ###: the seed changes nothing')
+        ns = lambda seed: run([sys.executable, SCRIPT, '--log_redact', path, '--redactNamespaces']
+                              + (['--seed', seed] if seed else [])).stdout
+        self.assertEqual(ns('abc'), ns('abc'))
+        self.assertNotEqual(ns('abc'), ns('abd'), 'the seed keys the REDACTED_ tokens')
+        self.assertNotEqual(ns(None), ns(None), 'unseeded tokens must use a random per-run key')
 
     def test_61_no_unsalted_md5_of_sensitive_values(self):
         import hashlib
@@ -1377,13 +1425,13 @@ class GroundTruth(CompactAsserts):
         visible = ['acmeshopdb', 'customer_profiles', 'AcmeBillingService', ADMIN_USER, UNKNOWN_USER]
         for name, gpath in STATE['gt_logs'].items():
             src_masks = open(gpath, encoding='utf-8', errors='replace').read().count('"###"')
-            for flags in ([], [], ['--char_replacement'], [],
-                          []):
+            for flags in ([], ['--char_replacement'], ['--char_replacement', '*']):
                 p = _ofuscate(gpath, *flags)
                 self.assertEqual(p.returncode, 0, p.stderr[-300:])
                 outl = [json.loads(x) for x in p.stdout.splitlines()]
                 self.assertEqual(len(outl), len(read_lines(gpath)))
-                self.assertGreaterEqual(p.stdout.count('"###"'), src_masks, (name, flags))
+                # every server mask survives (as CHAR*3 with --char_replacement)
+                self.assertGreaterEqual(p.stdout.count('"%s"' % mask_for(flags)), src_masks, (name, flags))
                 for n in visible:               # what the server left visible is now gone
                     self.assertNotIn(n, p.stdout, (name, flags, n))
             fix = _ofuscate(gpath).stdout.splitlines()
@@ -1403,6 +1451,29 @@ class GroundTruth(CompactAsserts):
                                          server_redact_all(strip_schema(s_ln['attr'][ck])),
                                          (name, s_ln['id']))
 
+
+    def test_g4_char_replacement_on_the_servers_own_redacted_logs(self):
+        """The real server writes '###'; --char_replacement [CHAR] turns exactly those masks
+        into CHAR*3 (and nothing else of the client data survives)."""
+        for ch in (None, '*'):
+            flags = ['--char_replacement'] + ([ch] if ch else [])
+            m = (ch or 'x') * 3
+            for name, gpath in STATE['gt_logs'].items():
+                p = _ofuscate(gpath, *flags)
+                self.assertEqual(p.returncode, 0, p.stderr[-300:])
+                self.assertNotIn('###', p.stdout, (name, flags))
+                glines = self._lines(gpath)
+                start = next(i for i, e in enumerate(glines)
+                             if '"###"' in json.dumps(e.get('attr', {}).get('command', {})))
+                out = [json.loads(x) for x in p.stdout.splitlines()]
+                n = 0
+                for g, o in list(zip(glines, out))[start:]:
+                    cmd = g.get('attr', {}).get('command')
+                    if isinstance(cmd, dict):
+                        self.assertEqual(strip_schema(o['attr']['command']),
+                                         server_redact_all(strip_schema(cmd), m), (name, flags, g['id']))
+                        n += 1
+                self.assertGreater(n, 10)
 
 
 def main():

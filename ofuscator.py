@@ -23,7 +23,7 @@ Two main operating modes, selected by a required top-level flag:
         --loadSchemaFile FILE    JSON schema of extra fields to obfuscate.
         --addFields FIELDS       Extra field names to obfuscate.
         --redactNamespaces       Replace db/collection names with REDACTED_<hash>.
-        --char_replacement       Use x-pattern instead of fruit/colour names.
+        --char_replacement [CHAR] Use CHAR (default 'x') instead of '###' everywhere.
         --char_fields FIELDS     Fields that get x-pattern in selective mode.
 
   --ftdc_redact
@@ -62,115 +62,40 @@ import hmac
 import ipaddress
 import glob as _glob
 
-# ── Word lists from fruitsalad ────────────────────────────────────────────────
-adjectives = [
-    "acerbic", "acidic", "acrid", "aged", "ambrosial", "ample", "appealing",
-    "appetizing", "aromatic", "astringent", "baked", "balsamic", "beautiful",
-    "bite-size", "bitter", "bland", "blazed", "blended", "blunt", "boiled",
-    "brackish", "briny", "brown", "browned", "burnt", "buttered", "caked",
-    "candied", "caramelized", "caustic", "center-cut", "char-broiled", "cheesy",
-    "chilled", "chocolate", "chunked", "cinnamon", "classic", "classy", "coated",
-    "cold", "cool", "copious", "country", "crafted", "creamed", "creamy",
-    "crisp", "crunchy", "cured", "dazzling", "deep-fried", "delicious",
-    "delightful", "distinctive", "doughy", "dressed", "dripping", "drizzled",
-    "dry", "edible", "elastic", "encrusted", "ethnic", "famous", "fantastic",
-    "fiery", "fizzy", "flaky", "flat", "flavored", "flavorful", "fleshy",
-    "fluffy", "fragile", "fresh", "fried", "frosty", "frozen", "fruity",
-    "full", "garlicky", "generous", "gingery", "glazed", "golden", "gourmet",
-    "greasy", "grilled", "gritty", "harsh", "heady", "heaping", "hearty",
-    "homemade", "honeyed", "honey-glazed", "hot", "ice-cold", "icy",
-    "indulgent", "infused", "intense", "juicy", "jumbo", "kosher", "large",
-    "lavish", "layered", "lean", "light", "lip-smacking", "lively", "low",
-    "luscious", "lush", "marinated", "mashed", "mellow", "mild", "minty",
-    "mixed", "moist", "mouth-watering", "natural", "nectarous", "nutty",
-    "oily", "organic", "peppery", "pickled", "piquant", "plain", "pleasant",
-    "plump", "poached", "pounded", "pulpy", "pungent", "pureed", "rich",
-    "ripe", "roasted", "robust", "rubbery", "saline", "salty", "sauteed",
-    "savory", "scrumptious", "seared", "seasoned", "sharp", "silky",
-    "simmered", "sizzling", "small", "smoked", "smoky", "smooth", "smothered",
-    "soothing", "sour", "special", "spiced", "spicy", "spongy", "sprinkled",
-    "stale", "steamed", "sticky", "strong", "stuffed", "succulent",
-    "sugary", "superb", "sweet", "sweetened", "syrupy", "tangy", "tart",
-    "tasty", "tender", "thick", "thin", "toasted", "toothsome", "topped",
-    "tossed", "tough", "traditional", "velvety", "vinegary", "warm",
-    "whipped", "whole", "wonderful", "yummy", "zesty", "zingy",
-]
-colors = [
-    'aliceblue', 'antiquewhite', 'aqua', 'aquamarine', 'azure', 'beige',
-    'bisque', 'black', 'blanchedalmond', 'blue', 'blueviolet', 'brown',
-    'burlywood', 'cadetblue', 'chartreuse', 'chocolate', 'coral',
-    'cornflowerblue', 'cornsilk', 'crimson', 'cyan', 'darkblue', 'darkcyan',
-    'darkgoldenrod', 'darkgray', 'darkgreen', 'darkkhaki', 'darkmagenta',
-    'darkolivegreen', 'darkorange', 'darkorchid', 'darkred', 'darksalmon',
-    'darkseagreen', 'darkslateblue', 'darkslategray', 'darkturquoise',
-    'darkviolet', 'deeppink', 'deepskyblue', 'dimgray', 'dodgerblue',
-    'firebrick', 'floralwhite', 'forestgreen', 'fuchsia', 'gainsboro',
-    'ghostwhite', 'gold', 'goldenrod', 'gray', 'green', 'greenyellow',
-    'honeydew', 'hotpink', 'indianred', 'indigo', 'ivory', 'khaki',
-    'lavender', 'lavenderblush', 'lawngreen', 'lemonchiffon', 'lightblue',
-    'lightcoral', 'lightcyan', 'lightgoldenrodyellow', 'lightgray',
-    'lightgreen', 'lightpink', 'lightsalmon', 'lightseagreen', 'lightskyblue',
-    'lightslategray', 'lightsteelblue', 'lightyellow', 'lime', 'limegreen',
-    'linen', 'magenta', 'maroon', 'mediumaquamarine', 'mediumblue',
-    'mediumorchid', 'mediumpurple', 'mediumseagreen', 'mediumslateblue',
-    'mediumspringgreen', 'mediumturquoise', 'mediumvioletred', 'midnightblue',
-    'mintcream', 'mistyrose', 'moccasin', 'navajowhite', 'navy', 'oldlace',
-    'olive', 'olivedrab', 'orange', 'orangered', 'orchid', 'palegoldenrod',
-    'palegreen', 'paleturquoise', 'palevioletred', 'papayawhip', 'peachpuff',
-    'peru', 'pink', 'plum', 'powderblue', 'purple', 'red', 'rosybrown',
-    'royalblue', 'saddlebrown', 'salmon', 'sandybrown', 'seagreen', 'seashell',
-    'sienna', 'silver', 'skyblue', 'slateblue', 'slategray', 'snow',
-    'springgreen', 'steelblue', 'tan', 'teal', 'thistle', 'tomato',
-    'turquoise', 'violet', 'wheat', 'white', 'whitesmoke', 'yellow',
-    'yellowgreen',
-]
-fruits = [
-    'apple', 'apricot', 'avocado', 'banana', 'breadfruit', 'bilberry',
-    'blackberry', 'blackcurrant', 'blueberry', 'boysenberry', 'cantaloupe',
-    'currant', 'cherry', 'cherimoya', 'cloudberry', 'coconut', 'cranberry',
-    'cucumber', 'damson', 'date', 'dragonfruit', 'durian', 'eggplant',
-    'elderberry', 'feijoa', 'fig', 'goji.berry', 'gooseberry', 'grape',
-    'raisin', 'grapefruit', 'guava', 'huckleberry', 'honeydew', 'jackfruit',
-    'jambul', 'jujube', 'kiwi.fruit', 'kumquat', 'lemon', 'lime', 'loquat',
-    'lychee', 'mango', 'marion.berry', 'melon', 'watermelon', 'rock.melon',
-    'miracle.fruit', 'mulberry', 'nectarine', 'nut', 'olive', 'orange',
-    'clementine', 'mandarine', 'blood.orange', 'tangerine', 'papaya',
-    'passionfruit', 'peach', 'pepper', 'chili.pepper', 'bell.pepper', 'pear',
-    'persimmon', 'physalis', 'pineapple', 'pomegranate', 'pomelo',
-    'mangosteen', 'quince', 'raspberry', 'western.raspberry', 'rambutan',
-    'redcurrant', 'salal.berry', 'salmon.berry', 'satsuma', 'star.fruit',
-    'strawberry', 'tamarillo', 'tomato', 'ugli.fruit', 'watermelon',
-]
+# ── Replacement helpers ───────────────────────────────────────────────────────
+#
+# Policy: everything that is redacted becomes the server's mask "###".  With
+# --char_replacement [CHAR] it becomes a pattern of CHAR ('x' when no CHAR is given):
+#   - values that used to be given a replacement word (names, hosts, users, emails,
+#     numbers ...) keep their SHAPE:  alice@acme.com -> xxxxx@xxxx.xxx
+#   - every literal "###" (client data, Status text ...) becomes CHAR * 3:  xxx
+
+# any Unicode letter or digit, but not '_' (kept as structure, like '.', '-', '@' ...)
+_ALNUM_RE = re.compile(r'[^\W_]')
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _char_replace(value):
-    """Replace every alphanumeric character with 'x', keep separators."""
-    return re.sub(r'[a-zA-Z0-9]', 'x', str(value))
+def _char_replace(value, ch='x'):
+    """Replace every letter / digit (any script, not only ASCII) with `ch`, keep separators."""
+    return _ALNUM_RE.sub(lambda m: ch, str(value))
 
 
-def _char_replace_email(value):
+def _char_replace_email(value, ch='x'):
     """Obfuscate email while keeping the structure visible: xxxxx@xxxxx.xxx"""
     if '@' in str(value):
         parts = str(value).split('@', 1)
-        local = re.sub(r'[a-zA-Z0-9]', 'x', parts[0])
-        domain_parts = parts[1].split('.')
-        domain = '.'.join(re.sub(r'[a-zA-Z0-9]', 'x', p) for p in domain_parts)
+        local = _char_replace(parts[0], ch)
+        domain = '.'.join(_char_replace(p, ch) for p in parts[1].split('.'))
         return local + '@' + domain
-    return _char_replace(value)
+    return _char_replace(value, ch)
 
 
-def _char_replace_url(value):
+def _char_replace_url(value, ch='x'):
     """Obfuscate URL: keep scheme and structural chars, replace the rest."""
     s = str(value)
-    # keep scheme (http://, https://) intact for readability
-    m = re.match(r'^(https?://)(.+)$', s)
+    m = re.match(r'^(https?://)(.+)$', s)      # keep the scheme for readability
     if m:
-        scheme = m.group(1)
-        rest = re.sub(r'[a-zA-Z0-9]', 'x', m.group(2))
-        return scheme + rest
-    return _char_replace(s)
+        return m.group(1) + _char_replace(m.group(2), ch)
+    return _char_replace(s, ch)
 
 
 # ── Main class ────────────────────────────────────────────────────────────────
@@ -628,7 +553,7 @@ class Obfuscator:
     arg_add_fields : list[str]
         Extra command-level field names to obfuscate (e.g. ['$comment', '_tid']).
     arg_char_replacement : bool
-        Replace strings with x-pattern instead of fruit/colour names.
+        False/None: '###' everywhere.  True: x-pattern.  A one-character string: that character.
     """
 
     def __init__(self, arg_logfile, arg_seed=None, arg_pii=False,
@@ -660,15 +585,24 @@ class Obfuscator:
         # ('$comment' / 'Comment' / 'comment' all become 'comment').
         self._af_norm = set(self._af_normalize(f) for f in self.add_fields if f)
         self._af_text_re = self._build_af_text_regex()
-        self.char_replacement = arg_char_replacement
-        # char_fields: only meaningful when char_replacement + seed are both set.
-        # When char_fields is populated, x-pattern applies only to those fields;
-        # everything else uses fruit/colour names (seeded).
-        # When char_fields is empty/None and char_replacement is True, ALL values
-        # get x-pattern (no fruit/colour at all).
+        # --char_replacement [CHAR]: None/False = off ('###'), True = 'x', 'c' = that char
+        if isinstance(arg_char_replacement, str):
+            if len(arg_char_replacement) != 1 or arg_char_replacement.isspace():
+                raise ValueError('--char_replacement expects ONE visible character')
+            self.char = arg_char_replacement
+        else:
+            self.char = 'x'
+        self.char_replacement = bool(arg_char_replacement)
+        # With no --char_fields the char pattern covers EVERYTHING, so a final pass also
+        # turns every '###' into CHAR*3.  With --char_fields only the listed fields use it.
+        self._global_char_mask = False   # set after char_fields is known
+        # char_fields: when populated (with --char_replacement) the char pattern applies only
+        # to those fields; everything else stays '###'.  When empty/None the char pattern
+        # covers everything.
         self.char_fields = set(f.strip() for f in (arg_char_fields or []))
+        self._global_char_mask = self.char_replacement and not self.char_fields
         # redact_namespaces: replace every db/collection name with a stable
-        # opaque REDACTED_<hash> token instead of fruit/colour words.
+        # opaque REDACTED_<hash> token instead of '###'.
         self.redact_namespaces = arg_redact_namespaces
         self.replacements = {}
         self._ns_tokens = {}   # learned raw name (ns/host/user/app) -> replacement
@@ -691,9 +625,9 @@ class Obfuscator:
         Return True when the current value should be x-pattern substituted.
 
         Rules:
-          - char_replacement=False  → never x-pattern
-          - char_replacement=True, char_fields empty → always x-pattern
-          - char_replacement=True, char_fields set   → x-pattern only for
+          - char_replacement off  → never char pattern ('###')
+          - char_replacement on, char_fields empty → always char pattern
+          - char_replacement on, char_fields set   → char pattern only for
             fields listed in char_fields (key must match)
         """
         if not self.char_replacement:
@@ -724,30 +658,9 @@ class Obfuscator:
 
     # ── Replacement strategies ────────────────────────────────────────────────
 
-    def _pick(self, pool, raw, tag=''):
-        """Deterministic word for `raw`: derived from an HMAC under the run key, not drawn
-        from a shared random stream.  With --seed the same value maps to the same word in
-        every file, in any order and with any combination of options; without a seed the
-        key is random per run."""
-        return pool[int(self._h(f'pick:{tag}:{raw}', 8), 16) % len(pool)]
-
-    def _fruit_for(self, raw):
-        """Map raw string to a deterministic fruit/colour/adjective word."""
-        return self.replacements.setdefault(raw, self._pick(fruits, raw, 'f'))
-
-    def _color_for(self, raw):
-        return self.replacements.setdefault(raw, self._pick(colors, raw, 'c'))
-
-    def _hash_for(self, raw):
-        key = json.dumps(raw, sort_keys=True) if not isinstance(raw, str) else raw
-        return self.replacements.setdefault(key, self._h(key))
-
     def _obfuscate_scalar(self, value, key=None):
-        """Obfuscate a scalar value according to the chosen strategy.
-
-        key is the field name that owns this value; used to decide whether
-        x-pattern or fruit/colour substitution applies when char_fields is set.
-        """
+        """Obfuscate a scalar value: '###' by default, the char pattern (shape kept) with
+        --char_replacement.  `key` is the field that owns the value (for --char_fields)."""
         if value is None:
             return value
         if isinstance(value, bool):
@@ -756,29 +669,17 @@ class Obfuscator:
             return value                   # already redacted (e.g. by the server)
         use_x = self._use_char_replace_for_key(key)
         if isinstance(value, (int, float)):
-            if use_x:
-                return re.sub(r'\d', 'x', str(value))
-            else:
-                return self._hash_for(str(value))
+            return re.sub(r'\d', self.char, str(value)) if use_x else _MASK
         if isinstance(value, str):
             if not value:
                 return value
-            if use_x:
-                # Detect sub-type for nicer output
-                if re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', value):
-                    return _char_replace_email(value)
-                if re.match(r'^https?://', value):
-                    return _char_replace_url(value)
-                return _char_replace(value)
-            else:
-                # Default: use fruit-salad mapping
-                if re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', value):
-                    local, domain = value.split('@', 1)
-                    return (self._fruit_for(local) + '@' +
-                            self._color_for(domain.split('.')[0]) + '.com')
-                if re.match(r'^https?://', value):
-                    return 'https://' + self._color_for(value) + '.' + self._fruit_for(value[::-1]) + '.com'
-                return self._fruit_for(value)
+            if not use_x:
+                return _MASK
+            if re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', value):
+                return _char_replace_email(value, self.char)
+            if re.match(r'^https?://', value):
+                return _char_replace_url(value, self.char)
+            return _char_replace(value, self.char)
         return value
 
     # ── PII: deep obfuscation of command internals ────────────────────────────
@@ -810,20 +711,16 @@ class Obfuscator:
                 if self.redact_namespaces:
                     part = self._redact_ns_part(part)
                 elif self._use_char_replace_for_key():
-                    part = _char_replace(part)
-                elif i == len(parts) - 1:
-                    part = self.replacements.setdefault(part, self._pick(fruits, part, 'f'))
-                elif i == len(parts) - 2:
-                    part = self.replacements.setdefault(part, self._pick(colors, part, 'c'))
+                    part = _char_replace(part, self.char)
                 else:
-                    part = self.replacements.setdefault(part, self._pick(adjectives, part, 'a'))
+                    part = _MASK
             replaced.append(part)
         return '.'.join(replaced)
 
     def _replace_string(self, match):
         if self._use_char_replace_for_key():
-            return '"' + _char_replace(match.group(0).strip('"')) + '"'
-        return '"' + self._h(str(match.group(0))) + '"'
+            return '"' + _char_replace(match.group(0).strip('"'), self.char) + '"'
+        return '"' + _MASK + '"'
 
     # ── Command-level field obfuscation (--addFields) ─────────────────────────
 
@@ -976,28 +873,18 @@ class Obfuscator:
         return hmac.new(self._salt, raw, hashlib.sha256).hexdigest()[:n]
 
     def _replacement(self, raw, kind='word', key=None):
+        """The ONE place that decides what a redacted name / host / user / value becomes:
+        '###', or its char pattern (shape kept) with --char_replacement."""
         raw = str(raw)
         if _is_masked(raw):
             return raw
-        if self._use_char_replace_for_key(key):
-            if kind == 'email':
-                return _char_replace_email(raw)
-            if kind == 'url':
-                return _char_replace_url(raw)
-            return _char_replace(raw)
-        return self._word_for(raw, kind)
-
-    def _word_for(self, raw, kind):
-        if kind in ('email', 'url'):
-            return self._obfuscate_scalar(raw)
-        if kind == 'host':
-            k = 'host:' + raw
-            v = self.replacements.get(k)
-            if v is None:
-                v = self._pick(colors, raw, 'hc') + '.' + self._pick(fruits, raw, 'hf') + '.invalid'
-                self.replacements[k] = v
-            return v
-        return self.replacements.setdefault(raw, self._pick(fruits, raw, 'f'))
+        if not self._use_char_replace_for_key(key):
+            return _MASK
+        if kind == 'email':
+            return _char_replace_email(raw, self.char)
+        if kind == 'url':
+            return _char_replace_url(raw, self.char)
+        return _char_replace(raw, self.char)
 
     def _learn_local_identity(self):
         """The operator's own hostname / OS user commonly end up in logs
@@ -1044,8 +931,8 @@ class Obfuscator:
             return obj
         text = obj if isinstance(obj, str) else json.dumps(obj, sort_keys=True)
         if self._use_char_replace_for_key(key):
-            return _char_replace(text)
-        return self.replacements.setdefault(text, self._h(text))
+            return _char_replace(text, self.char)
+        return _MASK
 
     def _map_ip(self, ip):
         try:
@@ -1054,18 +941,10 @@ class Obfuscator:
             return ip
         if addr.is_loopback or addr.is_unspecified:
             return ip
-        if ip in self._ipmap:
-            return self._ipmap[ip]
         if self._use_char_replace_for_key():
-            fake = 'xxx.xxx.xxx.xxx' if addr.version == 4 else _char_replace(ip)
-        else:
-            d = bytes.fromhex(self._h('ip:' + ip, 8))
-            if addr.version == 4:
-                fake = '192.168.%d.%d' % (d[0], d[1])
-            else:
-                fake = 'fd00::%x:%x' % (d[0] << 8 | d[1], d[2] << 8 | d[3])
-        self._ipmap[ip] = fake
-        return fake
+            return (('.'.join([self.char * 3] * 4)) if addr.version == 4
+                    else _char_replace(ip, self.char))
+        return _MASK
 
     # ══════════════════════════════════════════════════════════════════════════
     # Content scanner: PII shapes in ANY string, whatever key it sits under
@@ -1379,13 +1258,9 @@ class Obfuscator:
             if self.redact_namespaces:
                 r = self._redact_ns_part(part)
             elif self._use_char_replace_for_key():
-                r = _char_replace(part)
-            elif i == n - 1:
-                r = self.replacements.setdefault(part, self._pick(fruits, part, 'f'))
-            elif i == n - 2:
-                r = self.replacements.setdefault(part, self._pick(colors, part, 'c'))
+                r = _char_replace(part, self.char)
             else:
-                r = self.replacements.setdefault(part, self._pick(adjectives, part, 'a'))
+                r = _MASK
             self._learn(part, r)
             out.append(r)
         return '.'.join(out)
@@ -1566,7 +1441,11 @@ class Obfuscator:
             return self._replacement(v, 'word', key)
         return v
 
-    def _redact_strings(self, v, key=None):
+    def _redact_strings(self, v, key=None, numbers=False):
+        """Redact every string leaf (and, with numbers=True, every number: used for keys
+        named like a secret, not for configuration trees where ports / sizes must stay)."""
+        if numbers and isinstance(v, (int, float)) and not isinstance(v, bool):
+            return self._obfuscate_scalar(v, key=key)
         if isinstance(v, str):
             if not v or v == '__system':
                 return v
@@ -1574,15 +1453,17 @@ class Obfuscator:
         if isinstance(v, dict):
             out = {}
             for k, x in v.items():
-                out[self._unique_key(out, self._scrub_key(k))] = self._redact_strings(x, k)
+                out[self._unique_key(out, self._scrub_key(k))] = self._redact_strings(x, k, numbers)
             return out
         if isinstance(v, list):
-            return [self._redact_strings(x, key) for x in v]
+            return [self._redact_strings(x, key, numbers) for x in v]
         return v
 
     def _sweep_ident(self, v, key, parent=None):
         if isinstance(v, str):
             return self._alias(v, 'word', key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return self._obfuscate_scalar(v, key=key)          # phone: 5550109999
         if isinstance(v, list):
             return [self._sweep_ident(x, key, parent) for x in v]
         if isinstance(v, dict):
@@ -1765,9 +1646,9 @@ class Obfuscator:
             return self._blob(v, k)
         if nk in _SENSITIVE_TREE_KEYS and isinstance(v, (dict, list, str)):
             return self._redact_strings(v, k)
-        if nk not in _HINT_SAFE and isinstance(v, (str, list, dict)):
+        if nk not in _HINT_SAFE and isinstance(v, (str, list, dict, int, float)):
             if _SECRET_HINT_RE.search(nk):
-                return self._redact_strings(v, k)
+                return self._redact_strings(v, k, numbers=True)    # pin / token / password: 4321
             if _IDENT_HINT_RE.search(nk):
                 return self._sweep_ident(v, k, parent)
             if _HOST_HINT_RE.search(nk):
@@ -1944,7 +1825,33 @@ class Obfuscator:
                            "id": 0, "msg": "Unparseable log line redacted",
                            "attr": {"lineNumber": lineno, "line": text}})
 
+    def _charmask(self, node):
+        """--char_replacement covers EVERYTHING: every literal '###' (client data, Status
+        'CodeName: ###', masks already present in a server-redacted log ...) becomes CHAR*3."""
+        m = self.char * 3
+        if isinstance(node, str):
+            return node.replace(_MASK, m) if _MASK in node else node
+        if isinstance(node, list):
+            return [self._charmask(x) for x in node]
+        if isinstance(node, dict):
+            out = {}
+            for k, v in node.items():
+                out[self._charmask(k) if isinstance(k, str) else k] = self._charmask(v)
+            return out
+        return node
+
     def _process_line(self, raw, lineno):
+        line = self._process_line_inner(raw, lineno)
+        if self._global_char_mask and _MASK in line:
+            if line.lstrip().startswith(('{', '[')):
+                try:
+                    return json.dumps(self._charmask(json.loads(line)))
+                except ValueError:
+                    pass
+            return line.replace(_MASK, self.char * 3)
+        return line
+
+    def _process_line_inner(self, raw, lineno):
         """Return the redacted line.  Output format == source format:
         JSON log in -> JSON lines out; text log in -> text lines out."""
         json_source = self.logtype == LogType.JSON
@@ -2334,14 +2241,15 @@ if __name__ == '__main__':
              'opaque token (REDACTED_<hash>). Well-known system namespaces '
              '(local, admin, config, $cmd) are preserved.')
     log_group.add_argument(
-        '--char_replacement', action='store_true', default=False,
-        help='Use x-pattern placeholders instead of fruit/colour names. '
-             'Alone: all obfuscated values become x-pattern. '
-             'With --seed and --char_fields: only the listed fields get x-pattern.')
+        '--char_replacement', nargs='?', const='x', default=None, metavar='CHAR',
+        help="Replace '###' by a pattern of CHAR (default 'x') everywhere: the former "
+             "'###' becomes CHAR CHAR CHAR and names / hosts / users / emails ... keep their "
+             "shape (alice@acme.com -> xxxxx@xxxx.xxx).  Default without this option: '###'. "
+             "Example: --char_replacement '*'")
     log_group.add_argument(
         '--char_fields', metavar='FIELDS', default=None,
-        help="Comma-separated field names that get x-pattern output when "
-             "--char_replacement and --seed are both active. "
+        help="Comma-separated field names that get the char pattern when "
+             "--char_replacement is active; every other redacted value stays '###'. "
              "Has no effect without --char_replacement.")
 
     # ── FTDC-redact options ───────────────────────────────────────────────────
@@ -2358,6 +2266,11 @@ if __name__ == '__main__':
              '(required with --ftdc_redact). Created if it does not exist.')
 
     args = parser.parse_args()
+
+    if args.char_replacement is not None and (
+            len(args.char_replacement) != 1 or args.char_replacement.isspace()):
+        parser.error("--char_replacement takes ONE visible character (e.g. 'x' or '*'), "
+                     "or none to use 'x'")
 
     # ── Dispatch ──────────────────────────────────────────────────────────────
 
